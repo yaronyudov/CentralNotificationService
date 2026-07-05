@@ -1,0 +1,44 @@
+sequenceDiagram
+    autonumber
+    participant U as User (browser)
+    participant API as Inbox API<br/>(JWT: tenantId from token)
+    participant DB as InboxItem<br/>(DDB PK=tenant#user)
+    participant CTR as unread_ctr<br/>(same DDB item)
+    participant WS as WebSocket
+    participant RG as ResolutionGroup
+
+    U->>API: GET /v1/inbox (JWT)
+    Note over API: tenantId from JWT — LeadingKeys IAM enforces it
+    API->>DB: Query PK=tenant#user WHERE expiresAt>now AND state IN(unread,read)
+    Note over DB: visibility filter: expired never returned<br/>resolved items masked until sweep lands
+    DB-->>API: page of items + cursor
+    API->>CTR: GET unread_ctr
+    CTR-->>API: count
+    API-->>U: {items, unreadCount, nextCursor}
+
+    U->>API: POST /v1/inbox/{id}/read
+    API->>DB: CondUpdate state=unread→read (condition: state=unread)
+    alt transition succeeded
+        DB-->>API: ok
+        API->>CTR: ADD unread_ctr -1
+        Note over CTR: atomic; conditional win ensures exactly one decrement
+        alt type.dismissOnRead=true
+            API->>DB: CondUpdate state=read→dismissed
+        end
+        API-->>U: 200
+        API->>WS: badge update
+    else already read/dismissed
+        DB-->>API: ConditionalCheckFailed
+        API-->>U: 200 (idempotent)
+    end
+
+    U->>API: POST /v1/inbox/{id}/resolve (A14 backup path)
+    Note over API: verify item belongs to this user's tenant (LeadingKeys)
+    API->>DB: GET item → verify ownership
+    API->>RG: trigger group sweep
+    RG->>DB: Query GSI groupKey → all items in group
+    RG->>DB: BatchUpdate state=resolved × N
+    RG->>CTR: ADD unread_ctr -1 × N users (conditional: was unread)
+    RG->>WS: remove × N + badge updates
+    API-->>U: 200
+    Note over API: audit: resolved{principal:user, path:inbox, episode}

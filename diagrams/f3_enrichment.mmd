@@ -1,0 +1,65 @@
+sequenceDiagram
+    autonumber
+    participant R as Router λ
+    participant RND as Renderer λ<br/>(baseline)
+    participant IW as Inbox Writer
+    participant DB as InboxItem<br/>(DDB)
+    participant WS as WebSocket
+    participant EML as Email Adapter
+    participant EQ as enrich-q<br/>(max-age guard 60s)
+    participant EN as Enricher λ
+    participant CACHE as Signature Cache<br/>(DDB hash→enrichedText)
+    participant BUD as TenantAiBudget<br/>(atomic counter)
+    participant CTX as Context Store<br/>(payload + allow-listed views)
+    participant MASK as PII Masker
+    participant LLM as Bedrock<br/>(Haiku, temp 0, no retention)
+    participant VAL as Validator<br/>(schema + groundedness)
+
+    R->>RND: DeliveryTask (type.aiEnrichment=true)
+    RND->>IW: baseline v1 (template-rendered)
+    IW->>DB: PutItem v1 (contentVersion=1)
+    IW->>WS: upsert v1 — user sees baseline ≤1.5s p99
+    Note over WS: SLO satisfied unconditionally
+    IW->>EML: hold: await v2 ≤4s, then send whichever is ready
+    R->>EQ: enrich job (parallel, off-path)
+
+    EN->>EQ: receive
+    EN->>CACHE: GET hash(typeId + key-fields bucketed)
+    alt cache hit
+        CACHE-->>EN: enrichedText
+        EN->>DB: UpdateItem v2 (contentVersion=2, enrichedAt)
+        EN->>WS: upsert v2 — upgrade in place (p95 ≤8s)
+        Note over EML: if v2 arrived within 4s window → email sends v2<br/>else baseline email already sent (FINAL, no correction)
+    else cache miss
+        EN->>BUD: Atomic check monthlyTokens < cap (A13)
+        alt over budget
+            BUD-->>EN: denied
+            Note over EN: audit: budget_denied — user keeps v1
+        else ok
+            EN->>CTX: fetch payloadRef (encrypted payload store)
+            EN->>CTX: fetch allow-listed context views ≤2 fetches ≤150ms (circuit-broken)
+            CTX-->>EN: payload + context (wallet: balance, lastTopUps…)
+            EN->>MASK: apply allow-list → PII→placeholders (§10.5)
+            MASK-->>EN: masked prompt fields
+            EN->>LLM: invoke (3s timeout, temp 0, no data retention)
+            alt timeout / error
+                LLM-->>EN: fail
+                Note over EN: audit: rejected{reason:timeout} — user keeps v1
+            else response
+                LLM-->>EN: JSON output
+                EN->>VAL: schema check + groundedness (every value ∈ payload∪context)
+                alt invalid
+                    VAL-->>EN: rejected
+                    Note over EN: audit: rejected{reason:groundedness} — user keeps v1
+                else valid
+                    VAL-->>EN: ok
+                    EN->>CACHE: SET hash → enrichedText (TTL=type TTL)
+                    EN->>BUD: ADD tokensUsed (billing)
+                    EN->>DB: UpdateItem v2 (contentVersion=2, enrichedAt)
+                    EN->>WS: upsert v2 ≤8s p95
+                    Note over EN: audit: upgraded{surface:inbox, tokens}
+                end
+            end
+        end
+    end
+    Note over EQ: if task age > upgradeWindowMs (60s) → discard<br/>audit: dropped:max-age — storm valve

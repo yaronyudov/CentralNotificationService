@@ -1,0 +1,48 @@
+sequenceDiagram
+    autonumber
+    participant BUS as Bus topics<br/>(AiTriageConfig.topics[])
+    participant TRI as Triage Service λ
+    participant SIG as Shape Cache<br/>(hash source+type+fields)
+    participant REG as Schema Registry<br/>(authoritative contracts)
+    participant BUD as AiTriageBudget<br/>(platform-level)
+    participant MASK as PII Masker
+    participant LLM as Bedrock
+    participant VAL as Vocabulary Validator<br/>(typeIds·roles·channels)
+    participant MAP as Mapping Store<br/>(origin:ai-triage, shadow)
+    participant ADM as Admin / policy
+    participant PIPE as Normal Pipeline
+
+    BUS->>TRI: event (from configured topic)
+    TRI->>SIG: GET shape-sig = hash(source, detail-type, field-set)
+    alt known shape
+        SIG-->>TRI: cached decision (rule or ignore)
+        Note over TRI: execute cached rule at ZERO model cost<br/>5-14M events/day → ~20-200 model calls/day
+        TRI->>PIPE: apply rule (notify or skip)
+    else novel shape
+        SIG-->>TRI: miss
+        TRI->>BUD: check platform AiTriageBudget
+        alt over budget
+            BUD-->>TRI: denied
+            Note over TRI: audit: unclassified — no notification, no guess
+        else ok
+            TRI->>REG: GET schema + compatibility constraints
+            REG-->>TRI: authoritative field types + compatibility
+            TRI->>MASK: schema + masked sample events (§10.5 pipeline)
+            MASK-->>TRI: PII-free input
+            TRI->>LLM: author a BusMapping: notify? whom? channels? fieldMap?
+            LLM-->>TRI: JSON BusMapping draft
+            TRI->>VAL: validate against existing typeIds + RBAC roles + channels
+            alt hallucinated role / unknown typeId
+                VAL-->>TRI: rejected
+                Note over TRI: audit: validation_failed — never a guess send
+            else valid
+                VAL-->>TRI: ok
+                TRI->>MAP: INSERT origin=ai-triage, status=SHADOW, kill_switch=true
+                TRI->>SIG: SET hash → rule (cache for future events)
+                Note over MAP: audit: rule_authored{shape, confidence}
+                ADM->>MAP: review diff → promote shadow→active
+                Note over ADM: or auto-promote if confidence ≥ policy threshold
+                MAP->>PIPE: rule now executes deterministically
+            end
+        end
+    end

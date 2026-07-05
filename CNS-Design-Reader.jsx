@@ -1,0 +1,1177 @@
+import React, { useEffect, useRef, useState } from "react";
+
+/* ————— palette (mirrors the DOCX identity) ————— */
+const C = {
+  ink: "#16222E", navy: "#143A5A", navySoft: "#2E4A66", paper: "#F6F8FA",
+  card: "#FFFFFF", line: "#DCE4EB", accent: "#E86A33", accentSoft: "#FCEFE7",
+  ok: "#2E7D5B", warn: "#B3541E", sub: "#5A6B7A", codeBg: "#0F1B26", codeInk: "#D7E3EE",
+  wash: "#E8EEF4",
+};
+const disp = { fontFamily: "'Avenir Next','Segoe UI',system-ui,sans-serif" };
+const mono = { fontFamily: "ui-monospace,'SF Mono','Cascadia Code',Consolas,monospace" };
+
+/* ————— tiny building blocks ————— */
+const Tag = ({ children, tone = "navy" }) => (
+  <span className="inline-block rounded-full px-2 py-0.5 text-xs font-semibold"
+    style={{ background: tone === "accent" ? C.accentSoft : tone === "ok" ? "#E3F1EA" : C.wash,
+      color: tone === "accent" ? C.warn : tone === "ok" ? C.ok : C.navy }}>{children}</span>
+);
+
+const Meter = ({ label, v, max = 5 }) => (
+  <div className="flex items-center gap-2 text-xs">
+    <span className="w-28 shrink-0" style={{ color: C.sub }}>{label}</span>
+    <div className="flex gap-1">
+      {Array.from({ length: max }).map((_, i) => (
+        <span key={i} className="h-2.5 w-4 rounded-sm"
+          style={{ background: i < v ? (v === max ? C.ok : C.navy) : C.line }} />
+      ))}
+    </div>
+    <span className="font-bold" style={{ color: C.navy }}>{v}/{max}</span>
+  </div>
+);
+
+const Table = ({ head, rows, tight }) => (
+  <div className="-mx-1 overflow-x-auto px-1">
+    <table className="w-full border-collapse text-left" style={{ minWidth: head.length > 3 ? 560 : 0 }}>
+      <thead><tr>{head.map((h, i) => (
+        <th key={i} className="whitespace-nowrap px-2 py-1.5 text-xs font-bold uppercase tracking-wide"
+          style={{ background: C.navy, color: "#fff" }}>{h}</th>))}</tr></thead>
+      <tbody>{rows.map((r, i) => (
+        <tr key={i} style={{ background: i % 2 ? "#F2F5F8" : C.card }}>
+          {r.map((c, j) => (
+            <td key={j} className={`align-top px-2 ${tight ? "py-1" : "py-1.5"} text-sm`}
+              style={{ color: C.ink, borderBottom: `1px solid ${C.line}` }}>{c}</td>))}
+        </tr>))}</tbody>
+    </table>
+  </div>
+);
+
+const Code = ({ children }) => (
+  <pre className="overflow-x-auto rounded-lg p-3 text-xs leading-relaxed"
+    style={{ ...mono, background: C.codeBg, color: C.codeInk }}>{children}</pre>
+);
+
+const Callout = ({ title, children }) => (
+  <div className="rounded-lg p-3" style={{ background: C.accentSoft, borderLeft: `4px solid ${C.accent}` }}>
+    <div className="text-sm font-bold" style={{ color: "#8A3A12" }}>{title}</div>
+    <div className="mt-1 text-sm" style={{ color: C.ink }}>{children}</div>
+  </div>
+);
+
+/* ————— SVG diagram primitives ————— */
+const Box = ({ x, y, w, h, l1, l2, tone }) => {
+  const fills = { accent: [C.accentSoft, C.accent, C.warn], light: ["#EFF3F7", C.line, C.sub],
+    queue: [C.wash, "#B9C8D6", C.navy], def: ["#FFFFFF", "#9FB0C0", C.navy] };
+  const [bg, st, tc] = fills[tone] || fills.def;
+  return (
+    <g>
+      <rect x={x} y={y} width={w} height={h} rx="8" fill={bg} stroke={st} strokeWidth="1.3" />
+      <text x={x + w / 2} y={y + (l2 ? h / 2 - 3 : h / 2 + 4)} textAnchor="middle"
+        fontSize="11.5" fontWeight="700" fill={tc} style={disp}>{l1}</text>
+      {l2 && <text x={x + w / 2} y={y + h / 2 + 11} textAnchor="middle" fontSize="9.5" fill={C.sub} style={disp}>{l2}</text>}
+    </g>
+  );
+};
+const Arrow = ({ d, dash, label, lx, ly, mid, tone }) => (
+  <g>
+    <path d={d} fill="none" stroke={tone === "accent" ? C.accent : dash ? C.sub : C.navy}
+      strokeWidth="1.4" strokeDasharray={dash ? "5 3" : "0"} markerEnd={`url(#${mid})`} />
+    {label && <text x={lx} y={ly} textAnchor="middle" fontSize="9.5" fill={tone === "accent" ? C.warn : C.sub} style={disp}>{label}</text>}
+  </g>
+);
+const Defs = ({ mid }) => (
+  <defs>
+    <marker id={mid} markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+      <path d="M0 0 L6 3 L0 6 z" fill={C.navy} />
+    </marker>
+  </defs>
+);
+
+/* ————— architecture: Solution A ————— */
+const ArchA = () => (
+  <div className="overflow-x-auto">
+    <svg width="950" height="352" viewBox="0 0 960 352" style={{ minWidth: 900 }}>
+      <Defs mid="mA" />
+      <Box x={8} y={34} w={122} h={42} l1="Product services" l2="explicit API" />
+      <Box x={8} y={104} w={122} h={42} l1="Company event bus" l2="notify + resolve rules" />
+      <Box x={170} y={34} w={118} h={42} l1="API Gateway" l2="SigV4 / JWT" />
+      <Box x={170} y={104} w={118} h={42} l1="EventBridge" l2="filter + transform" />
+      <Box x={326} y={62} w={128} h={54} l1="Normalizer" l2="schema · idemp · PII→ref" />
+      <Box x={326} y={138} w={128} h={30} l1="payload + idemp (DDB)" tone="light" />
+      <Box x={492} y={72} w={56} h={32} l1="route q" tone="queue" />
+      <Box x={586} y={34} w={124} h={44} l1="Router" l2="resolve-check · fan-out" />
+      <Box x={586} y={104} w={124} h={44} l1="Renderer" l2="templates · deep links" />
+      <Box x={748} y={26} w={62} h={26} l1="q·in-app" tone="queue" />
+      <Box x={748} y={70} w={62} h={26} l1="q·email" tone="queue" />
+      <Box x={748} y={114} w={62} h={26} l1="q·slack" tone="queue" />
+      <Box x={838} y={16} w={114} h={46} l1="Inbox writer" l2="DDB + WS push" />
+      <Box x={838} y={70} w={114} h={38} l1="SES adapter" l2="outbox → SES" />
+      <Box x={838} y={116} w={114} h={38} l1="Slack adapter" l2="token bucket" />
+      <Box x={586} y={196} w={124} h={48} l1="Enricher" l2="cache · budget · guards" tone="accent" />
+      <Box x={748} y={204} w={100} h={34} l1="Bedrock" l2="Haiku · temp 0" />
+      <Box x={8} y={300} w={300} h={34} l1="each queue → own DLQ (alarm@1) + redrive" tone="light" />
+      <Box x={326} y={300} w={626} h={34} l1="Audit: every stage → Firehose → S3 Parquet → Athena (+ 7-day hot index)" tone="light" />
+      <Arrow d="M130 55 H166" mid="mA" />
+      <Arrow d="M130 125 H166" mid="mA" />
+      <Arrow d="M288 55 L322 78" mid="mA" />
+      <Arrow d="M288 125 L322 102" mid="mA" />
+      <Arrow d="M390 116 V134" mid="mA" dash />
+      <Arrow d="M454 89 H488" mid="mA" />
+      <Arrow d="M548 84 L582 62" mid="mA" />
+      <Arrow d="M648 78 V100" mid="mA" />
+      <Arrow d="M710 118 L744 40" mid="mA" />
+      <Arrow d="M710 126 H744 " mid="mA" label="tasks / channel" lx={727} ly={98} />
+      <Arrow d="M710 134 L744 126" mid="mA" />
+      <Arrow d="M810 39 H834" mid="mA" />
+      <Arrow d="M810 83 L834 88" mid="mA" />
+      <Arrow d="M810 127 L834 134" mid="mA" />
+      <Arrow d="M676 78 V192" mid="mA" dash label="enrich job" lx={676} ly={170} tone="accent" />
+      <Arrow d="M710 221 H744" mid="mA" />
+      <Arrow d="M710 208 H926 V66" mid="mA" dash tone="accent" label="upgrade v2 (WS upsert)" lx={824} ly={200} />
+      <Arrow d="M390 168 V296" mid="mA" dash />
+    </svg>
+    <div className="mt-1 text-xs" style={{ color: C.sub }}>
+      Bus rules carry action: notify | resolve — wallet.funds_added resolves implicitly. The Router runs the pre-delivery resolved-check (episode guard) and splits over-cap fan-outs into paced waves. High-res diagrams: diagrams.zip / DOCX.
+    </div>
+  </div>
+);
+
+/* ————— architecture: Solution B ————— */
+const ArchB = () => (
+  <div className="overflow-x-auto">
+    <svg width="950" height="316" viewBox="0 0 960 316" style={{ minWidth: 900 }}>
+      <Defs mid="mB" />
+      <Box x={8} y={44} w={104} h={40} l1="ALB" />
+      <Box x={150} y={38} w={122} h={52} l1="Ingest svc" l2="EKS · normalize" />
+      <g>
+        <rect x={312} y={18} width={156} height={200} rx="10" fill="#fff" stroke={C.navy} strokeWidth="1.6" />
+        <text x={390} y={36} textAnchor="middle" fontSize="12" fontWeight="700" fill={C.navy} style={disp}>Amazon MSK</text>
+        {["ingest", "route", "channel.*", "audit", "DLT + redrive"].map((t, i) => (
+          <g key={t}>
+            <rect x={324} y={46 + i * 32} width={132} height={24} rx="5" fill={C.wash} stroke="#B9C8D6" />
+            <text x={390} y={62 + i * 32} textAnchor="middle" fontSize="10" fill={C.navy} style={mono}>{t}</text>
+          </g>
+        ))}
+        <text x={390} y={212} textAnchor="middle" fontSize="9" fill={C.sub} style={disp}>RF=3 · acks=all · key tenant#recipient · 7-day replay</text>
+      </g>
+      <Box x={508} y={24} w={150} h={44} l1="Router / Renderer" l2="resolve-check · KEDA" />
+      <Box x={508} y={84} w={150} h={44} l1="Channel adapters" l2="in-app · SES · Slack" />
+      <Box x={508} y={144} w={150} h={40} l1="Enricher" l2="same gates (A13)" tone="accent" />
+      <Box x={508} y={200} w={150} h={34} l1="S3 sink (audit → Parquet)" tone="light" />
+      <Box x={700} y={16} w={120} h={48} l1="Aurora PG" l2="inbox partitions · config" />
+      <Box x={700} y={78} w={120} h={38} l1="Redis" l2="idemp · counters · pub/sub" />
+      <Box x={700} y={130} w={120} h={38} l1="WS gateway" l2="pods" />
+      <Box x={848} y={130} w={104} h={38} l1="Users" l2="badge / upsert" />
+      <Box x={848} y={196} w={104} h={40} l1="SES · Slack" l2="providers" />
+      <Box x={8} y={266} w={460} h={34} l1="EKS: KEDA scales on Kafka lag · Karpenter Graviton + ~70% Spot" tone="light" />
+      <Box x={508} y={266} w={444} h={34} l1="TTL = DROP PARTITION (pg_partman) · Glue Schema Registry on every topic" tone="light" />
+      <Arrow d="M112 64 H146" mid="mB" />
+      <Arrow d="M272 64 L308 58" mid="mB" label="produce: ingest" lx={288} ly={44} />
+      <Arrow d="M468 58 L504 46" mid="mB" label="route" lx={488} ly={42} />
+      <Arrow d="M468 90 L504 100" mid="mB" label="channel.*" lx={486} ly={110} />
+      <Arrow d="M468 150 L504 160" mid="mB" dash label="enrich" lx={486} ly={172} tone="accent" />
+      <Arrow d="M468 190 L504 214" mid="mB" dash label="audit" lx={484} ly={214} />
+      <Arrow d="M658 92 V44 H696" mid="mB" label="inbox rows (COPY 500)" lx={640} ly={12} />
+      <Arrow d="M658 100 H696" mid="mB" label="counters" lx={678} ly={94} />
+      <Arrow d="M700 116 V126" mid="mB" dash label="pub/sub" lx={735} ly={124} />
+      <Arrow d="M820 149 H844" mid="mB" tone="accent" />
+      <Arrow d="M658 118 V216 H844" mid="mB" label="email / slack" lx={760} ly={228} />
+      <Arrow d="M658 168 L730 168 L730 120" mid="mB" dash tone="accent" label="upgrade v2" lx={700} ly={182} />
+    </svg>
+  </div>
+);
+
+/* ————— sequence diagram engine ————— */
+const Seq = ({ actors, steps }) => {
+  const colW = Math.max(96, Math.min(150, Math.floor(880 / actors.length)));
+  const W = actors.length * colW;
+  const rowH = 30, top = 58;
+  const H = top + steps.length * rowH + 14;
+  const cx = (i) => i * colW + colW / 2;
+  return (
+    <div className="overflow-x-auto">
+      <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ minWidth: Math.min(W, 880) }}>
+        <Defs mid="ms" />
+        {actors.map((a, i) => (
+          <g key={i}>
+            <rect x={i * colW + 8} y={6} width={colW - 16} height={30} rx="7" fill={C.navy} />
+            <text x={cx(i)} y={25} textAnchor="middle" fontSize="10.5" fontWeight="700" fill="#fff" style={disp}>{a}</text>
+            <line x1={cx(i)} y1={40} x2={cx(i)} y2={H - 6} stroke={C.line} strokeDasharray="3 4" />
+          </g>
+        ))}
+        {steps.map((s, k) => {
+          const y = top + k * rowH;
+          if (s.note) return (
+            <g key={k}>
+              <rect x={10} y={y - 12} width={W - 20} height={22} rx="6"
+                fill={s.tone === "accent" ? C.accentSoft : "#EDF2F7"} stroke={s.tone === "accent" ? C.accent : C.line} />
+              <text x={W / 2} y={y + 3} textAnchor="middle" fontSize="9.7" fontStyle="italic"
+                fill={s.tone === "accent" ? C.warn : C.sub} style={disp}>{s.note}</text>
+            </g>
+          );
+          const x1 = cx(s.f), x2 = cx(s.t);
+          const dir = x2 > x1 ? 1 : -1;
+          return (
+            <g key={k}>
+              <path d={`M${x1} ${y} L${x2 - 4 * dir} ${y}`} fill="none"
+                stroke={s.tone === "accent" ? C.accent : s.dashed ? C.sub : C.navy}
+                strokeWidth="1.4" strokeDasharray={s.dashed ? "5 3" : "0"} markerEnd="url(#ms)" />
+              <text x={(x1 + x2) / 2} y={y - 6} textAnchor="middle" fontSize="9.7"
+                fontWeight={s.tone === "accent" ? 700 : 500}
+                fill={s.tone === "accent" ? C.warn : C.ink} style={disp}>{s.label}</text>
+            </g>
+          );
+        })}
+      </svg>
+      <div className="mt-1 text-[11px]" style={{ color: C.sub }}>solid = sync · dashed = async / return · orange = user-visible moment</div>
+    </div>
+  );
+};
+
+/* ————— per-solution sequence flows ————— */
+const FLOWS = {
+  A: {
+    f1: {
+      label: "1 · Explicit single-user",
+      actors: ["Producer", "Ingest", "DynamoDB", "Router", "Renderer", "Inbox wr", "WS", "SES"],
+      steps: [
+        { f: 0, t: 1, label: "POST /v1/notifications (eventId)" },
+        { f: 1, t: 2, label: "cond-put tenant#eventId (idempotency)" },
+        { f: 1, t: 0, label: "202 accepted · dup-safe", dashed: true },
+        { f: 1, t: 3, label: "envelope → route q (payloadRef)" },
+        { note: "Router: cached type config + org overrides + RBAC" },
+        { f: 3, t: 4, label: "tasks — notifId per recipient × channel" },
+        { f: 4, t: 5, label: "in-app task (rendered)" },
+        { f: 5, t: 2, label: "BatchWrite (cond on notifId) + badge ctr" },
+        { f: 5, t: 6, label: "upsert + badge → user  (p99 ≈ 0.6 s)", tone: "accent" },
+        { f: 4, t: 7, label: "email task → outbox(sending→sent) → send" },
+        { note: "every hop emits audit (Firehose) · every queue has its own DLQ" },
+      ],
+    },
+    f2: {
+      label: "2 · Fan-out + implicit resolve",
+      actors: ["Event bus", "Ingest", "Router/Resolver", "RBAC", "Inbox wr", "DynamoDB", "Slack"],
+      steps: [
+        { f: 0, t: 1, label: "wallet.underfunded (notify-mapping)" },
+        { f: 1, t: 2, label: "envelope · entityRef wallet#W1 · eventTime" },
+        { f: 2, t: 5, label: "resolved-check: no group ⇒ open episode 1" },
+        { f: 2, t: 3, label: "members(finance-admin @ org)" },
+        { f: 3, t: 2, label: "120 users (cached ≤60 s)", dashed: true },
+        { f: 2, t: 4, label: "120 tasks — paced waves if > 5,000 (R3)" },
+        { f: 4, t: 5, label: "120 items share groupKey · WS upserts" },
+        { f: 2, t: 6, label: "ONE channel post (token bucket)", tone: "accent" },
+        { note: "later — payments emits the fix event; nobody calls an API" },
+        { f: 0, t: 1, label: "wallet.funds_added → resolve-mapping (action:resolve)" },
+        { f: 1, t: 5, label: "group → resolved · episode closed (tombstone if unseen)" },
+        { f: 2, t: 5, label: "sweep: GSI groupKey → batch-resolve ×120" },
+        { note: "WS remove ×120 · read path masks the group until the sweep lands", tone: "accent" },
+        { note: "dedup guard: late underfunded with eventTime ≤ resolvedAt ⇒ suppressed as dup (audited); later ⇒ episode 2 (A15)" },
+        { note: "backups if implicit misses: owning service calls resolve API · any role recipient resolves from inbox (A14)" },
+      ],
+    },
+    f3: {
+      label: "3 · AI enrichment (detailed)",
+      actors: ["Router", "Renderer", "Inbox", "Enricher", "Cache·Budget", "Context DB", "Bedrock"],
+      steps: [
+        { f: 0, t: 1, label: "task (type.aiEnrichment on)" },
+        { f: 1, t: 2, label: "v1 baseline ships — ALWAYS ≤ 1.5 s", tone: "accent" },
+        { f: 0, t: 3, label: "enrich job — parallel · max-age guard", dashed: true },
+        { f: 3, t: 4, label: "signature GET: hash(type + key fields, bucketed)" },
+        { note: "hit ⇒ upsert cached v2 instantly · storm = 10k identical events = 1 model call (shield)" },
+        { f: 3, t: 4, label: "TenantAiBudget gate (A13) — atomic, BEFORE invoke" },
+        { f: 3, t: 5, label: "fetch payload by payloadRef (encrypted store)" },
+        { f: 3, t: 5, label: "fetch allow-listed context views — e.g. wallet: balance, last top-ups (≤150 ms, breaker)" },
+        { note: "PII mask: only allow-listed fields, names/emails → placeholders — §10.5, identical pipeline for triage" },
+        { f: 3, t: 6, label: "prompt = payload ∪ context · 3 s timeout · temp 0" },
+        { f: 6, t: 3, label: "JSON output", dashed: true },
+        { note: "validate: JSON schema + groundedness — every number/date/entity must exist in payload ∪ fetched context" },
+        { f: 3, t: 2, label: "upsert v2 (WS replace) · p95 ≤ 8 s", tone: "accent" },
+        { note: "upgrade = conditional DB UPDATE of the item (contentVersion++) — store is truth; WS just pushes it" },
+        { note: "email holds ≤ 4 s for v2 then sends baseline — FINAL (no correction email); inbox window: 60 s" },
+        { note: "any gate fails ⇒ user keeps v1 · breaker open ⇒ model skipped · drop is not on the ladder" },
+      ],
+    },
+    f4: {
+      label: "4 · Inbox read / resolve",
+      actors: ["User", "Inbox API", "DynamoDB", "WS"],
+      steps: [
+        { f: 0, t: 1, label: "GET /v1/inbox  (JWT: tenant + user)" },
+        { f: 1, t: 2, label: "Query PK = tenant#user — IAM LeadingKeys" },
+        { note: "visibility filter: expiresAt > now · not resolved · state ∈ {unread, read}" },
+        { f: 2, t: 1, label: "page (cursor)", dashed: true },
+        { f: 1, t: 0, label: "items + badge (atomic counter)", dashed: true },
+        { f: 0, t: 1, label: "POST /{id}/read  → dismissOnRead?" },
+        { f: 1, t: 2, label: "cond. update + counter −1" },
+        { f: 0, t: 1, label: "POST /{id}/resolve — backup resolver (A14)", tone: "accent" },
+        { f: 1, t: 2, label: "verify item ownership → trigger group sweep" },
+        { f: 3, t: 0, label: "remove ×N + badge — every recipient", dashed: true, tone: "accent" },
+      ],
+    },
+    f5: {
+      label: "5 · AI event triage",
+      actors: ["Bus topics", "Triage svc", "Shape cache", "Bedrock", "Mapping store", "Admin", "Pipeline"],
+      steps: [
+        { note: "scope is config: AiTriageConfig { topics[], mode T1–T4, thresholds, budget, shadow|active }" },
+        { f: 0, t: 1, label: "event stream from inspected topics" },
+        { f: 1, t: 2, label: "shape sig = hash(source, detail-type, field-set)" },
+        { note: "known shape ⇒ cached rule (or 'ignore') executes at ZERO model cost — 5–14M/day ⇒ ~20–200 calls" },
+        { f: 1, t: 2, label: "novel shape: AiTriageBudget gate (platform, A13 pattern)" },
+        { note: "PII: schema + MASKED samples only — same §10.5 masking, no-retention Bedrock, region-pinned" },
+        { f: 1, t: 3, label: "author a rule: notify? whom (role)? channels? → JSON BusMapping" },
+        { f: 3, t: 1, label: "rule draft", dashed: true },
+        { f: 1, t: 4, label: "validate vs vocabulary: typeIds · RBAC roles · channels — a hallucinated role cannot compile" },
+        { note: "lands in SHADOW · origin: ai-triage · per-tenant kill switch", tone: "accent" },
+        { f: 5, t: 4, label: "promote shadow → active (or auto per confidence policy)" },
+        { f: 4, t: 6, label: "later events execute the rule deterministically (notify / resolve)", tone: "accent" },
+        { note: "wrong-send impossible by construction: unmappable ⇒ audited 'unclassified' — never a guess delivery" },
+      ],
+    },
+  },
+  B: {
+    f1: {
+      label: "1 · Explicit single-user",
+      actors: ["Producer", "Ingest svc", "Redis", "Kafka", "Router CG", "Inbox CG", "Aurora", "WS pods"],
+      steps: [
+        { f: 0, t: 1, label: "POST /v1/notifications (eventId)" },
+        { f: 1, t: 2, label: "SETNX tenant#eventId (idempotency)" },
+        { f: 1, t: 0, label: "202 accepted · dup-safe", dashed: true },
+        { f: 1, t: 3, label: "produce → route  (acks=all, key tenant)" },
+        { f: 3, t: 4, label: "consume route (KEDA on lag)" },
+        { note: "Router CG: config cached · resolve-check · render · notifId per recipient × channel" },
+        { f: 4, t: 3, label: "produce → channel.inapp / channel.email" },
+        { f: 3, t: 5, label: "consume channel.inapp (key tenant#recipient — ordered)" },
+        { f: 5, t: 6, label: "COPY batch 500 → daily partition" },
+        { note: "offset committed ONLY after durable write — at-least-once, effect-once via notifId unique constraint" },
+        { f: 5, t: 2, label: "unread ctr + publish (pub/sub)" },
+        { f: 2, t: 7, label: "upsert + badge → user", dashed: true, tone: "accent" },
+      ],
+    },
+    f2: {
+      label: "2 · Fan-out + implicit resolve",
+      actors: ["Event bus", "Ingest svc", "Router/Resolver", "RBAC", "Inbox CG", "Aurora·Redis", "Slack"],
+      steps: [
+        { f: 0, t: 1, label: "wallet.underfunded (notify-mapping)" },
+        { f: 1, t: 2, label: "route record · entityRef · eventTime" },
+        { f: 2, t: 5, label: "resolved-check row ⇒ open episode 1" },
+        { f: 2, t: 3, label: "members(finance-admin @ org)" },
+        { f: 3, t: 2, label: "120 users (cached ≤60 s)", dashed: true },
+        { f: 2, t: 4, label: "channel.inapp ×120 — waves if > cap (R3)" },
+        { f: 4, t: 5, label: "COPY 120 rows share groupKey · pub/sub upserts" },
+        { f: 2, t: 6, label: "ONE channel post (token bucket)", tone: "accent" },
+        { note: "later — payments emits the fix event; nobody calls an API" },
+        { f: 0, t: 1, label: "wallet.funds_added → resolve-mapping (action:resolve)" },
+        { f: 1, t: 5, label: "UPDATE group → resolved (tombstone row if unseen)" },
+        { f: 2, t: 5, label: "sweep: index on groupKey → resolve ×120" },
+        { note: "pub/sub remove ×120 · read path masks the group until the sweep lands", tone: "accent" },
+        { note: "dedup guard: eventTime ≤ resolvedAt ⇒ suppressed as dup; later ⇒ episode 2 (A15) — same Router code as A" },
+        { note: "backups: owning service resolve API · role recipient from inbox (A14)" },
+      ],
+    },
+    f3: {
+      label: "3 · AI enrichment (detailed)",
+      actors: ["Router CG", "Renderer", "Inbox", "Enricher CG", "Redis", "Aurora ctx", "Bedrock"],
+      steps: [
+        { f: 0, t: 1, label: "route record (type.aiEnrichment on)" },
+        { f: 1, t: 2, label: "v1 baseline ships — ALWAYS ≤ 1.5 s", tone: "accent" },
+        { f: 0, t: 3, label: "produce → enrich topic (off-path)", dashed: true },
+        { f: 3, t: 4, label: "signature GET (Redis) — storm ⇒ 1 call (shield)" },
+        { f: 3, t: 4, label: "TenantAiBudget gate (A13) — same config store" },
+        { f: 3, t: 5, label: "fetch payload row + allow-listed context views (RLS, ≤150 ms, breaker)" },
+        { note: "PII mask: allow-listed fields only → placeholders — same §10.5 pipeline as Solution A" },
+        { f: 3, t: 6, label: "prompt = payload ∪ context · 3 s · temp 0" },
+        { f: 6, t: 3, label: "JSON output", dashed: true },
+        { note: "validate: schema + groundedness vs payload ∪ context — mismatch discards enrichment" },
+        { f: 3, t: 2, label: "UPDATE v2 + pub/sub → WS · p95 ≤ 8 s", tone: "accent" },
+        { note: "upgrade = UPDATE row (contentVersion++) — store is truth; email immutable, inbox window 60 s" },
+        { note: "commit offset either way — enrichment can never wedge the topic; stale tasks (max-age) are skipped" },
+      ],
+    },
+    f4: {
+      label: "4 · Inbox read / resolve",
+      actors: ["User", "Inbox API", "Aurora", "Redis", "WS pods"],
+      steps: [
+        { f: 0, t: 1, label: "GET /v1/inbox  (JWT: tenant + user)" },
+        { f: 1, t: 2, label: "SELECT … WHERE tenant,user (RLS) LIMIT 25" },
+        { note: "visibility filter: expires_at > now() · not resolved · partition pruning by day" },
+        { f: 2, t: 1, label: "page (keyset cursor)", dashed: true },
+        { f: 1, t: 3, label: "GET unread ctr" },
+        { f: 1, t: 0, label: "items + badge", dashed: true },
+        { f: 0, t: 1, label: "POST /{id}/read  → dismissOnRead?" },
+        { f: 1, t: 2, label: "UPDATE state · ctr −1 (Redis)" },
+        { f: 0, t: 1, label: "POST /{id}/resolve — backup resolver (A14)", tone: "accent" },
+        { f: 1, t: 2, label: "verify ownership → group sweep" },
+        { f: 4, t: 0, label: "remove ×N + badge — every recipient", dashed: true, tone: "accent" },
+      ],
+    },
+    f5: {
+      label: "5 · AI event triage",
+      actors: ["MSK topics", "Triage CG", "Redis shapes", "Bedrock", "Mapping (Aurora)", "Admin", "Pipeline"],
+      steps: [
+        { f: 0, t: 1, label: "consume AiTriageConfig.topics[] (KEDA on lag)" },
+        { f: 1, t: 2, label: "shape sig lookup — known ⇒ cached rule, zero model cost" },
+        { f: 1, t: 2, label: "novel: AiTriageBudget gate" },
+        { note: "Glue Schema Registry hands the model AUTHORITATIVE contracts — it reads schemas, not guesses (B advantage)" },
+        { note: "PII: masked samples only — same §10.5 pipeline" },
+        { f: 1, t: 3, label: "author rule (JSON BusMapping)" },
+        { f: 3, t: 1, label: "draft", dashed: true },
+        { f: 1, t: 4, label: "vocabulary validation → INSERT status=shadow, origin=ai-triage" },
+        { f: 5, t: 4, label: "promote (or confidence auto-policy)" },
+        { f: 4, t: 6, label: "rule executes in the normal consumer path", tone: "accent" },
+        { note: "unmappable ⇒ audited 'unclassified' — never a guess delivery" },
+      ],
+    },
+  },
+};
+
+/* ————— content data ————— */
+const capacity = [
+  ["Ingested notifications", "167/s · 14.4M/day", "≈ 5.0M/day"],
+  ["Channel sends (×2.16)", "31.1M/day", "10.9M/day"],
+  ["Peak in-app write rate", "≈ 1,200 rows/s (burst)", "—"],
+  ["Worst single fan-out", "5,000 rows ⇒ 200 batches < 2 s", "over cap ⇒ paced waves (R3)"],
+  ["Inbox steady size", "≈ 350 GB", "≈ 120 GB"],
+  ["LLM calls (5% opt-in)", "250k/day", "87k/day (−70% via cache)"],
+];
+
+const latency = [
+  ["API auth + Normalizer", "20 ms", "60 ms"],
+  ["route queue dwell", "15 ms", "120 ms"],
+  ["Router + Renderer (cached)", "35 ms", "150 ms"],
+  ["in-app queue dwell", "15 ms", "120 ms"],
+  ["Inbox write + counter", "15 ms", "60 ms"],
+  ["WebSocket push", "20 ms", "90 ms"],
+  ["Total vs 1.5 s SLO", "≈ 120 ms", "≈ 0.6 s  (2.5× headroom)"],
+];
+
+const latencyB = [
+  ["ALB + Ingest (auth · SETNX idempotency)", "8 ms", "40 ms"],
+  ["produce → route (acks=all, RF=3)", "6 ms", "25 ms"],
+  ["route consumer (config · resolve-check · render)", "12 ms", "60 ms"],
+  ["produce → channel.inapp", "6 ms", "25 ms"],
+  ["inbox consumer COPY (500 rows / 25 ms linger)", "15 ms", "70 ms"],
+  ["Aurora commit + Redis counter", "6 ms", "25 ms"],
+  ["pub/sub → WS pod → client", "8 ms", "40 ms"],
+  ["Total vs 1.5 s SLO", "≈ 60 ms", "≈ 0.29 s (5× headroom)"],
+];
+
+const iterA = [
+  ["1.1", "Step Functions → SQS choreography", "−96% orchestration cost; no cross-channel coupling"],
+  ["1.1", "Inline LLM → progressive enhancement", "in-app p99 ≤ 1.5 s regardless of model health"],
+  ["1.1", "Per-stage DLQs + one-click redrive", "MTTR ↓ · “DLQ = 0” verifiable per stage"],
+  ["1.1", "Audit: DynamoDB → Firehose→S3 Parquet + Athena", "≈ −90% audit cost; SQL over the trail"],
+  ["1.1", "30 s polling → WebSocket push", "badge < 200 ms; −80% read units"],
+  ["1.2", "Payload-by-reference (encrypted item)", "queues PII-free; tiny messages"],
+  ["1.2", "Enrichment signature-cache + config budgets (A13)", "−70–95% model calls in storms"],
+  ["1.2", "Graviton arm64 + SQS batch 10", "−20% price-perf; −70% invocations"],
+  ["1.2", "Capacity mix: provisioned steady / on-demand spiky", "−30% DynamoDB spend"],
+  ["1.3", "Provisioned concurrency on the 2 sync hops", "p99 stable through 833/s ramps"],
+  ["1.3", "RBAC circuit breaker + ≤10 min stale reads", "fan-outs survive dependency brownout"],
+  ["1.3", "One full-jitter backoff library everywhere", "no synchronized retry storms"],
+];
+
+const compare = [
+  ["First production tenant", "weeks", "months"],
+  ["Ops load", "low — no clusters", "real — ≈ 0.5–1 FTE"],
+  ["Replay / ordering", "archive replay, no ordering", "native 7-day replay · per-recipient order"],
+  ["In-app p99", "≈ 0.6 s", "≈ 0.3–0.5 s"],
+  ["Infra @ today", "≈ $3.4k/mo, → 0 at idle", "≈ $3k/mo floor + eng time"],
+  ["Cost @ 10×", "linear (≈ $30k+)", "sub-linear (≈ $8–12k)"],
+  ["Enterprise silo cell", "stamp IaC — pay per use", "cluster+DB floor per cell"],
+];
+
+const entities = [
+  ["NotificationType", "channels, ttl, resolvable, dismissOnRead, aiEnrichment{promptFields, contextFetch, caps}, resolve.byRecipients (A14), retentionDays"],
+  ["TenantAiBudget", "monthlyTokenCap + per-type caps — lives WITH type config, same admin surface (A13)"],
+  ["BusMapping", "action: notify | RESOLVE · eventPattern → typeId + fieldMap (+recipientSpec) · origin human|ai-triage · shadow|active"],
+  ["InboxItem", "PK tenant#user · SK createdAt#notifId · state · groupKey (GSI) · expiresAt (TTL)"],
+  ["ResolutionGroup", "tenant#groupKey · episode · resolvedAt · sweepState — resolve-before-trigger writes a tombstone (TTL = type TTL)"],
+  ["DeliveryRecord", "outbox per notifId·channel: sending→sent|failed|suppressed + providerMsgId"],
+  ["IdempotencyKey", "tenant#eventId, TTL 48 h — duplicate producer calls are free"],
+  ["AuditEvent", "auditId = notifId#stage#attempt (idempotent) · ts · tenantId · stage · outcome · channelRef · principalRef · tokensIn/Out (AI) · reason — no payload, no free-text PII, recipient as HMAC token · DOCX §8, §11"],
+];
+
+const aiOptions = [
+  { n: "1", t: "Bounded synchronous", rec: false,
+    how: "Enrichment runs inline under a hard 3 s deadline (one retry on a smaller model inside it); the enriched text renders once and is IDENTICAL on every channel — email says exactly what the inbox says. Enriched in-app p99 ≈ 5 s: an explicit, documented SLO exception for opted-in types only.",
+    storm: "Signature cache in front (first event of a storm pays the model, the next 10,000 hit cache in ms) + a global concurrency cap on the Enricher + TenantAiBudget checked BEFORE each invoke — a storm costs at most (unique signatures × 1 call), then degrades to template.",
+    degrade: "Timeout / failed validation → baseline; sustained errors open a breaker and the inline step is skipped entirely until a half-open probe passes. Choose when cross-channel parity beats p99 (compliance / legal tone)." },
+  { n: "2", t: "Progressive enhancement", rec: true,
+    how: "Baseline ships ≤ 1.5 s unconditionally; the enrich job runs in parallel and upgrades the item in place (WS upsert, p95 ≤ 8 s). Email waits ≤ 4 s for the enriched body — still inside the 5 s handoff — then sends baseline. The SLO is never a function of model health.",
+    storm: "Same cache + pre-invoke budget as option 1, PLUS a max-age guard on the enrich queue: the baseline already shipped, so any enrichment task older than the upgrade window is DISCARDED — a storm backlog drains by dropping stale upgrade work, never by calling the model faster. Call rate is bounded by unique-signature arrival, not event rate.",
+    degrade: "Any failed gate ⇒ the user keeps v1. There is no user-visible failure mode. Default for everything." },
+  { n: "3", t: "Pre-computed / cached", rec: false,
+    how: "Plainly: do the model work BEFORE the notification exists, then reuse it. Two triggers — (a) at config-publish time, the model pre-generates the parts that don't depend on event values (tone, framing, type explanation); (b) at FIRST occurrence of a payload signature (key fields hashed, numbers bucketed e.g. gapUsd → '$10–15k'), the enrichment is generated once and stored. Every later event with that signature reuses it at zero model cost, zero added latency — the first user pays option-2 semantics once, everyone after gets enriched content at template speed.",
+    storm: "This option IS a storm shield: a storm is thousands of events sharing one signature = exactly one model call + N cache reads. It is structurally unable to storm the model.",
+    degrade: "Freshness is bounded by signature granularity (per-event nuance is lost; bucketing needs tuning); entries carry a per-type TTL; a cache miss falls through to option-2 semantics. Best for repetitive, storm-prone types — and as the cache layer of the recommendation." },
+];
+
+const triageOpts = [
+  { n: "T1", t: "Design-time author", cost: "≈ $0–10/mo", rec: true,
+    how: "On schema publish/change (and on demand) the model reads the topic SCHEMA + a few masked samples and drafts complete mappings — notify or not, typeId, fieldMap, roles, channels — straight into shadow mode; a human diff-reviews and promotes.",
+    storm: "Model calls are coupled to schema-change rate (tens–hundreds/week), not event rate: a runtime storm of any size causes exactly ZERO model calls.",
+    con: "Reacts to new schemas, not to novel events inside known schemas; human review adds days. Degrades to exactly today's static system." },
+  { n: "T2", t: "Signature-gated runtime", cost: "≈ $1–20/mo", rec: true,
+    how: "Every inspected event gets a shape signature = hash(source, detail-type, field-set). Known ⇒ the cached decision (an authored rule, or explicit 'ignore') runs deterministically at zero model cost. Novel ⇒ ONE call authors a rule; per-event value variation lives inside the rule's fieldMap, so the model writes it once and the rule engine substitutes values forever after.",
+    storm: "5–14M events/day collapse to unique-shape rate (~20–200/day) — and a storm is by definition many events of ONE shape, so a storm costs at most one model call. AiTriageBudget still gates that call.",
+    con: "First event of a new shape waits ~2–4 s (or ships unclassified if strict). By construction there is no path to a WRONG send — only a missed one, which the audit surfaces." },
+  { n: "T3", t: "Sampled / batched classifier", cost: "≈ $30–100/mo", rec: false,
+    how: "A small model scores BATCHES (~50 events/call) from a 1–5% sample plus 100% of never-seen shapes, emitting rule suggestions + anomaly flags into a review queue — advisory, never acting directly.",
+    storm: "Batching ÷50, sampling ÷20–100, and output is advisory — a mis-scored storm produces review noise, never deliveries. Budget-capped like everything else.",
+    con: "Sampling misses singletons; batching adds minutes. Best as a periodic anomaly-review feed ('topic X started carrying refund events — want a rule?'), not a delivery path." },
+  { n: "T4", t: "Two-stage funnel (evolution)", cost: "≈ $50–200/mo", rec: false,
+    how: "Stage 1 is non-LLM and per-event: embeddings similarity vs labeled exemplars or a tiny distilled classifier on Lambda (micro-cents/1k). Clear-yes executes rules, clear-no is ignored; only the ambiguous ~1–3% band escalates to the LLM for a real decision — true near-real-time triage of never-seen events.",
+    storm: "The expensive model only sees the residue of a cheap filter (band × rate, budget-gated) — and T2's signature cache still sits in front, so storms of known shapes never reach stage 2 at all.",
+    con: "Needs labeled exemplars + threshold tuning (most engineering); a mis-tuned band overspends or under-detects. Degrades to a wider 'unclassified + audit' band — still never a guess delivery." },
+];
+
+const drOptions = [
+  ["1 · Multi-AZ single region ✦", "AZ loss ≈ 0 / minutes · region loss: hours via IaC redeploy + archive re-ingest", "baseline", "Accepts hours of degradation for a full-region AWS event — defensible; documented."],
+  ["2 · Warm standby", "≤ 1 min / 15–60 min (pilot-light) · < 15 min (warm)", "+15–70%", "Needs practiced failover + replicated idempotency; config drift is the silent killer."],
+  ["3 · Active-active", "≈ 0 / ≈ 0", "≈ +100%", "Conflict + double-send complexity; buy only if notifications become contractual critical-path."],
+];
+
+const failures = [
+  ["Slack 429 storm", "Retry-After honored via delayed requeue; per-workspace bucket isolates tenants"],
+  ["Email fails?", "SES event publishing: send/delivery/bounce/complaint/reject/delay per message → audit + CloudWatch; alarms; retry → DLQ (alarm@1). Fails loud, never silent (R4)"],
+  ["Trigger arrives after the fix", "Router resolved-check: eventTime ≤ resolvedAt ⇒ suppressed as dup + audited; later ⇒ new episode delivered (A15)"],
+  ["Implicit resolve misses", "layered backups: owning-service resolve API → role-recipient inbox resolve (A14) → type TTL as final backstop"],
+  ["LLM slow / down / pricey", "breaker + config budgets (A13) + cache; users just keep baseline content"],
+  ["Implicit path rate control", "No API GW in front of EventBridge — rate control is consumer-side: Lambda reserved concurrency cap + SQS depth alarm + idempotency key. Runaway bus emitter fills route-q (paged) but cannot corrupt data (DOCX §5.1a)"],
+    ["RBAC brownout", "≤10 min stale membership, then park-queue + alarm — never guess"],
+  ["DynamoDB hot partition", "counter write-sharding + jittered batch backoff; over-cap events arrive in paced waves"],
+  ["Rule misconfig / drift", "shadow-mode deploys + hourly canary; gap repaired by archive replay — applies to resolve-mappings too"],
+  ["Poison message", "maxReceive → DLQ (alarm at 1) → inspect, fix, idempotent redrive"],
+  ["Badge shows a wrong number", "read-time recount overwrites on open (L1); weekly sweep catches dormants; its drift-rate metric is the bug tripwire that pages (§5.4)"],
+];
+
+const risksX = [
+  { n: 1, sev: "High", st: "accepted · mitigated", t: "Slack rate limits vs large fan-outs",
+    what: "Slack allows ~1 msg/s per channel (plus workspace ceilings). Hundreds of deliveries into one workspace get HTTP 429 no matter how fast CNS is — users see \u201CSlack is late\u201D while the in-app copy already landed. Biggest tenants feel it first.",
+    dec: "Token bucket per workspace/channel ahead of the API, Retry-After honored via delayed requeue, ONE post per channel event (never N DMs); one tenant's backlog can't slow another. Remaining lever is product-shaped: chatty types → one updating thread/summary. Per-workspace queue age lives on the golden dashboard." },
+  { n: 2, sev: "High", st: "needs security sign-off", t: "RBAC freshness window",
+    what: "Role membership is cached: ≤60 s fresh, served up to 10 min stale during an RBAC brownout. Inside that window a just-removed user can still receive a role notification — for payroll content that's an information-disclosure question, so the bound must be signed-off policy, not a caching accident.",
+    dec: "Security to ratify the 60 s / 10 min bounds. Sensitive types get the optional read-time re-check: membership verified when the item is about to display, so even a stale delivery is never seen. Beyond staleness the task parks with an alarm — the system never guesses membership." },
+  { n: 3, sev: "High", st: "✦ decided: split", t: "Fan-out above the 5,000 cap — digest vs split",
+    what: "SPLIT = keep the audience whole, deliver in successive paced waves of chunks — everyone still gets their own actionable copy; cost: the tail arrives later, channel volume stays N×. DIGEST = collapse into fewer messages (one channel summary / per-user roll-ups) — caps noise, but removes per-person items and changes the product experience.",
+    dec: "Split, for now: over-cap events auto-segment into paced waves (write pressure smoothed for DynamoDB/SES/Slack; SLO applies per wave) and an over-cap alarm makes the demand visible to product. Digest stays a deliberate per-type option for noisy types later — never a silent behavior under load. (A5, §5.2 in the DOCX)" },
+  { n: 4, sev: "High", st: "✦ answered", t: "Email via SES — is failure observable?",
+    what: "Open question: we push to SES — do we see what happens after, and can we alert if it fails? Answer: yes. SES event publishing streams send / delivery / bounce / complaint / reject / delivery-delay events per message into the audit trail and CloudWatch, so per-message status is queryable (7-day hot index).",
+    dec: "Alarms on handoff-failure rate, bounce >2%, complaint >0.1%. A failed handoff retries with jitter, then lands in the email DLQ which alarms at depth 1 — an email can fail, never silently. Residual owned outside CNS: domain reputation (SPF/DKIM/DMARC, warm-up) with the platform email team (A10); CNS enforces suppression automatically." },
+  { n: 5, sev: "Med", st: "✦ resolved by config", t: "LLM cost per tenant",
+    what: "Who caps a tenant's AI spend, and where does that live?",
+    dec: "A13: TenantAiBudget is a first-class entity in the SAME central config store as notification types — same admin API, same UI, same change audit ( /v1/admin/tenants/{id}/ai-budget, optional per-type caps ). The Enricher checks atomic usage counters against that config BEFORE every model call; exhaustion → baseline + admin alert. Still open: sensible default caps per pricing tier — a product/finance input." },
+  { n: 6, sev: "Med", st: "live", t: "Corporate-bus schema drift",
+    what: "Bus mappings pick producer-event fields by path (e.g. $.detail.walletId). A producer rename errors nowhere — the mapping silently yields blanks, so notifications stop firing or would render half-empty, and the producing team has no idea CNS depended on that field. Now applies to RESOLVE-mappings too: drift there means the implicit resolver silently stops resolving.",
+    dec: "Three tripwires: mapping changes deploy in shadow mode (simulated + diffed first); templates are strict — a missing required variable is a render error → DLQ + alarm, never a blank to a user; hourly canary events per critical type alarm on silence. For resolve-mappings the backups (service API, recipient resolve, TTL) bound the damage. Next: schema registry on the corporate bus (native in Solution B) + owning-team tags so drift pages the producer too." },
+  { n: 7, sev: "Med", st: "pre-wired", t: "Per-user preferences vs org overrides (phase 2)",
+    what: "Users will want personal controls — mute a type, digest my email, quiet hours. Added naively this collides with org overrides (org says \u201Cemail on\u201D, user says \u201Cmute\u201D — who wins?) and opens a compliance hole (a worker must never mute \u201Cpayslip issued\u201D).",
+    dec: "Reserved now: precedence fixed as user < org < platform, and every type carries userOptOut: allowed | forbidden so mandatory types can't be silenced. The seam exists in today's schema — preferences later are an additive feature, not a migration." },
+  { n: 8, sev: "Med", st: "plan documented", t: "WebSocket scale past ~100k concurrent",
+    what: "API Gateway WebSocket has ceilings on concurrent connections and — usually the binding one — on NEW-CONNECTION RATE: a deploy or blip that reconnects everyone at once can throttle even when steady state fits comfortably.",
+    dec: "Contained by design: clients fully sync from the store on connect and on opening the Bell, so throttling degrades badge freshness — never truth. Quota raises pre-requested; client reconnects use full jitter; beyond that, shard connections across multiple WS endpoints by tenant hash (the registry already keys by tenant — a routing change, not a data change)." },
+  { n: 9, sev: "Med", st: "✦ system-driven + dedup guard", t: "Resolution ownership & stale-trigger dedup",
+    what: "Resolution happens in the Papaya system, not by a dev: PRIMARY — the implicit resolve-mapping recognizes the fix event (wallet.funds_added) and resolves the group with zero producer code. SECONDARY — the service owning \u201Cissue fixed\u201D calls the resolve API. BACKUP — any role recipient resolves from the inbox (A14); type TTL is the final backstop, so nothing is stuck forever.",
+    dec: "The pipeline also CHECKS STATUS before delivering: ResolutionGroup keeps episode + resolvedAt (a resolve for an unseen group writes a tombstone). Trigger eventTime ≤ resolvedAt ⇒ suppress + audit as dup — the silence-as-dedup backstop for when trigger and fix interleave or a producer re-emits; eventTime > resolvedAt ⇒ genuine re-occurrence ⇒ episode+1 delivered. Residual (A15): producers should supply eventTime; absent/skewed clocks fall back to a per-type resolveQuietPeriod whose defaults still need choosing." },
+  { n: 10, sev: "Low", st: "decided", t: "Template versioning across in-flight retries",
+    what: "A task can sit in retry/DLQ while an admin publishes template v5. Redriving with the NEW version can mismatch the original event context — or diverge from copies already sent before the failure.",
+    dec: "Published versions are immutable; every task pins templateVersion at render time; redrives reuse the pin by default, and an operator passes an explicit re-render flag only when the new template is itself the fix. Cheap, deterministic, audit-friendly." },
+  { n: 11, sev: "Med", st: "new · scoped", t: "AI event-triage correctness & governance",
+    what: "Letting a model author bus mappings adds two failure classes: a WRONG rule (mis-targeted audience/channel) and an UNWANTED rule (noise). Contained by construction: outputs are schema-validated against the existing type/role/channel vocabulary (a hallucinated role can't compile), land in shadow mode, carry origin:ai-triage + kill switch, and spend against a platform AiTriageBudget.",
+    dec: "Still open: who owns promotion of AI-authored mappings (platform admin vs producing team); confidence floor for any auto-activation policy; a feedback loop where dismiss/mute signals down-rank an AI rule (needs a lightweight review queue); per-tenant cost attribution if triage volume grows." },
+];
+
+/* ————— pipeline hero ————— */
+const STAGES = [
+  { label: "Ingest", note: "API + bus · notify & resolve" },
+  { label: "Route", note: "resolve-check · fan-out" },
+  { label: "Render", note: "templates · deep links" },
+  { label: "Enrich", note: "opt-in AI, off-path" },
+  { label: "Deliver", note: "inbox · email · Slack" },
+  { label: "Prove", note: "audit · DLQ = 0" },
+];
+const Pipeline = () => (
+  <div className="mt-4 overflow-x-auto pb-1">
+    <div className="flex min-w-max items-stretch">
+      {STAGES.map((s, i) => (
+        <div key={s.label} className="flex items-center">
+          <div className="rounded-lg px-3 py-2" style={{ background: i === 3 ? C.accentSoft : C.wash, border: `1px solid ${i === 3 ? C.accent : C.line}` }}>
+            <div className="text-xs font-bold" style={{ color: i === 3 ? C.warn : C.navy, ...disp }}>{s.label}</div>
+            <div className="text-[11px]" style={{ color: C.sub }}>{s.note}</div>
+          </div>
+          {i < STAGES.length - 1 && (
+            <svg width="22" height="10" className="shrink-0"><path d="M0 5h16m0 0-5-4m5 4-5 4" stroke={C.navy} strokeWidth="1.5" fill="none" /></svg>
+          )}
+        </div>
+      ))}
+    </div>
+    <div className="mt-1 text-[11px]" style={{ color: C.sub }}>
+      Every stage: own queue · own retry policy · own DLQ. Enrichment (orange) can improve a message — never block one.
+    </div>
+  </div>
+);
+
+/* ————— sections registry ————— */
+const SECTIONS = [
+  { id: "verdict", label: "Verdict" },
+  { id: "numbers", label: "Numbers" },
+  { id: "solA", label: "Solution A" },
+  { id: "iters", label: "Iterations" },
+  { id: "solB", label: "Solution B" },
+  { id: "maps", label: "Architecture" },
+  { id: "flows", label: "Flows" },
+  { id: "compare", label: "A vs B" },
+  { id: "solA-ddb", label: "A vs Aurora" },
+  { id: "limits", label: "Limits" },
+  { id: "inbox", label: "Inbox rules" },
+  { id: "api", label: "APIs" },
+  { id: "data", label: "Data" },
+  { id: "ai", label: "AI" },
+  { id: "audit", label: "Audit" },
+  { id: "dr", label: "DR" },
+  { id: "fail", label: "Failure" },
+  { id: "adr", label: "ADRs" },
+  { id: "risk", label: "Risks" },
+];
+
+export default function App() {
+  const [open, setOpen] = useState(() => new Set(["verdict", "numbers"]));
+  const [active, setActive] = useState("verdict");
+  const [arch, setArch] = useState("A");
+  const [flowSol, setFlowSol] = useState("A");
+  const [flow, setFlow] = useState("f1");
+  const refs = useRef({});
+
+  const toggle = (id) => setOpen((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const allOpen = open.size === SECTIONS.length;
+  const setAll = () => setOpen(allOpen ? new Set() : new Set(SECTIONS.map((s) => s.id)));
+  const jump = (id) => {
+    setOpen((s) => new Set(s).add(id));
+    requestAnimationFrame(() => refs.current[id]?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  };
+
+  useEffect(() => {
+    const io = new IntersectionObserver(
+      (es) => es.forEach((e) => e.isIntersecting && setActive(e.target.dataset.sec)),
+      { rootMargin: "-20% 0px -70% 0px" }
+    );
+    Object.values(refs.current).forEach((el) => el && io.observe(el));
+    return () => io.disconnect();
+  }, []);
+
+  const Section = ({ id, title, kicker, children }) => (
+    <section ref={(el) => (refs.current[id] = el)} data-sec={id}
+      className="scroll-mt-24 rounded-xl" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+      <button onClick={() => toggle(id)} className="flex w-full items-center gap-3 px-4 py-3 text-left">
+        <span className="text-lg font-extrabold" style={{ color: C.navy, ...disp }}>{title}</span>
+        {kicker && <span className="hidden text-xs sm:inline" style={{ color: C.sub }}>{kicker}</span>}
+        <span className="ml-auto text-sm font-bold" style={{ color: C.accent }}>{open.has(id) ? "–" : "+"}</span>
+      </button>
+      {open.has(id) && <div className="space-y-3 px-4 pb-4">{children}</div>}
+    </section>
+  );
+
+  const Pick = ({ value, set, opts }) => (
+    <div className="flex flex-wrap gap-2">
+      {opts.map(([v, l]) => (
+        <button key={v} onClick={() => set(v)} className="rounded-full px-3 py-1 text-xs font-bold"
+          style={value === v ? { background: C.navy, color: "#fff" } : { background: C.wash, color: C.navy }}>{l}</button>
+      ))}
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen pb-16" style={{ background: C.paper, color: C.ink, ...disp }}>
+      <header className="px-4 pt-6" style={{ background: C.navy }}>
+        <div className="mx-auto max-w-3xl pb-4 text-white">
+          <div className="text-xs font-semibold uppercase tracking-widest" style={{ color: "#9FB6CB" }}>
+            Papaya Global · Architects team · system-design home task
+          </div>
+          <h1 className="mt-1 text-2xl font-extrabold leading-tight sm:text-3xl">Central Notification Service</h1>
+          <p className="mt-1 text-sm" style={{ color: "#C9D8E6" }}>
+            Two architectures, iterated to convergence — now with implicit event-driven resolution, the episode dedup guard, and AI-assisted event triage (4 budget options). Companion to the 53-page document.
+          </p>
+          <Pipeline />
+        </div>
+      </header>
+
+      <nav className="sticky top-0 z-10 px-2 py-2" style={{ background: C.paper, borderBottom: `1px solid ${C.line}` }}>
+        <div className="mx-auto flex max-w-3xl items-center gap-2 overflow-x-auto">
+          {SECTIONS.map((s) => (
+            <button key={s.id} onClick={() => jump(s.id)}
+              className="whitespace-nowrap rounded-full px-3 py-1 text-xs font-bold"
+              style={active === s.id ? { background: C.navy, color: "#fff" } : { background: C.wash, color: C.navy }}>
+              {s.label}
+            </button>
+          ))}
+          <button onClick={setAll} className="ml-auto whitespace-nowrap rounded-full px-3 py-1 text-xs font-bold"
+            style={{ border: `1px solid ${C.accent}`, color: C.warn }}>
+            {allOpen ? "Collapse all" : "Expand all"}
+          </button>
+        </div>
+      </nav>
+
+      <main className="mx-auto max-w-3xl space-y-3 px-3 pt-3">
+        <div className="rounded-lg px-4 py-2 text-xs" style={{ background: C.wash, color: C.sub }}>
+          Section references below point into the 49-page DOCX (e.g. §5.8, §9, §11). Each section header in this reader names its DOCX counterpart.
+        </div>
+        <Section id="verdict" title="The verdict" kicker="read this if you read nothing else">
+          <Callout title="Build Solution A (serverless event mesh). Keep B as the scale-triggered evolution.">
+            At 167–833 req/s the workload sits squarely inside managed serverless envelopes. A meets every NFR with
+            ≈2.5× latency headroom, has no idle cost floor, and the enterprise-silo tier is a stamp of the same IaC.
+            Producers, adapters and the inbox contract are backbone-agnostic, so moving to B later swaps the middle — not the edges.
+          </Callout>
+          <div className="grid gap-2 sm:grid-cols-3">
+            {[["Move to B when…", "sustained > ~60k/min, or unit economics cross (~4–6× volume)"],
+              ["…or when", "replay becomes a compliance / product feature"],
+              ["…or when", "per-recipient ordering becomes contractual"]].map(([t, d], i) => (
+              <div key={i} className="rounded-lg p-3" style={{ background: C.wash }}>
+                <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>{t}</div>
+                <div className="mt-1 text-sm">{d}</div>
+              </div>
+            ))}
+          </div>
+          <div className="text-sm">
+            <span className="font-bold" style={{ color: C.navy }}>Decided in this revision (also: all capacity numbers are at the <b>stated targets — 10k/min sustained, 50k/min burst — with no diurnal reduction</b>): </span>
+            resolution is <b>system-driven</b> — implicit resolve-mappings (<span style={mono}>wallet.funds_added</span> → resolve) first,
+            owning-service API second, role recipients as backup (R9/A14) · the Router runs a <b>pre-delivery resolved-check</b> that
+            silences stale triggers as dups via an episode guard (A15) · over-cap fan-outs <b>split into paced waves</b> (R3) ·
+            SES delivery is <b>event-level observable</b> (R4) · AI budgets are <b>config beside the types</b> (R5/A13) ·
+            AI can now <b>triage unmapped topics by authoring rules</b> — 4 budget options in the AI section (R11).
+          </div>
+        </Section>
+
+        <Section id="numbers" title="The arithmetic" kicker="stated targets — DOCX §3.2, §5.3, §6.4">
+          <Table head={["Quantity", "Sustained-max", "Realistic"]} rows={capacity} />
+          <div className="text-sm" style={{ color: C.sub }}>
+            Numbers at <b>stated targets — no diurnal reduction applied</b>. Sustained = 10k/min design point; Burst = 50k/min peak — 10k/min sustained, 50k/min burst (the requirements, not a diurnal reduction). Nothing here needs exotic technology — 1,200 writes/s and ~350 GB fit comfortably in DynamoDB or partitioned Aurora.
+            The real question is economics, operational load, and failure isolation — exactly what separates A and B.
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="rounded-lg p-3" style={{ border: `1px solid ${C.line}` }}>
+              <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Monthly cost (realistic)</div>
+              <div className="mt-1 text-sm">Infra A ≈ <b>$3.4k/mo</b> at sustained · SES ≈ <b>$8.5k</b> sustained / <b>$24k</b> at burst · Bedrock ≈ <b>$1.5–3k</b> · AI triage ≈ <b>$1–30</b></div>
+              <div className="text-xs" style={{ color: C.sub }}>Email volume is the true driver — a product lever, not an architecture lever.</div>
+            </div>
+            <div className="rounded-lg p-3" style={{ border: `1px solid ${C.line}` }}>
+              <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>SLOs</div>
+              <div className="mt-1 text-sm">in-app p99 <b>≤ 1.5 s</b> (measured ≈ 0.6 s) · email handoff p99 <b>≤ 5 s</b> (≈ 1.2 s) · DLQ steady <b>0</b> · no silent drops</div>
+            </div>
+          </div>
+        </Section>
+
+        <Section id="solA" title="Solution A — serverless event mesh" kicker="EventBridge · SQS · Lambda · DynamoDB">
+          <div className="text-sm">
+            API Gateway (HTTP + WebSocket) and EventBridge rules — carrying <b>both notify- and resolve-mappings</b> — converge into a
+            <b> Normalizer</b> → one canonical envelope (schema-validated, idempotent on <span style={mono}>tenant#eventId</span>,
+            PII tokenized, payload stored by reference). A <b>Router</b> applies config + org overrides, runs the
+            <b> pre-delivery resolved-check</b> (stale triggers suppressed as dups — episode guard, A15), resolves roles via a cached
+            RBAC client, and emits one <span style={mono}>DeliveryTask</span> per recipient×channel — splitting over-cap events into
+            paced waves (R3). Each channel owns a queue, an adapter, and a DLQ; audit streams via Firehose → S3 Parquet → Athena.
+          </div>
+          <Table head={["Stage (flow 1)", "p50", "p99"]} rows={latency} tight />
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="rounded-lg p-3" style={{ background: C.wash }}>
+              <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Tenant isolation (ADR-2)</div>
+              <div className="mt-1 text-sm">Every key starts with <span style={mono}>tenantId</span>; the inbox role carries an IAM
+                <span style={mono}> dynamodb:LeadingKeys</span> condition bound to the JWT — cross-tenant reads are rejected below application code.
+                Enterprise tier = the same IaC stamped as a private cell.</div>
+            </div>
+            <div className="rounded-lg p-3" style={{ background: C.wash }}>
+              <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>No silent drops — and no zombie alerts</div>
+              <div className="mt-1 text-sm">Durable enqueue <i>before</i> ACK; per-stage DLQs alarmed at depth 1; SES event publishing makes every
+                email's fate visible (R4); and the resolved-check means an already-fixed issue can't re-notify anyone (R9).</div>
+            </div>
+          </div>
+        </Section>
+
+        <Section id="iters" title="How it was optimized" kicker="v1.0 → v1.3, re-assessed each pass">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="rounded-lg p-3" style={{ border: `1px solid ${C.line}` }}>
+              <div className="mb-2 text-xs font-bold uppercase" style={{ color: C.sub }}>v1.0 baseline (Step Functions, inline LLM…)</div>
+              <div className="space-y-1.5">
+                <Meter label="Operational" v={3} /><Meter label="Security" v={4} /><Meter label="Reliability" v={3} /><Meter label="Performance" v={3} /><Meter label="Cost" v={1} />
+              </div>
+              <div className="mt-2 text-xs" style={{ color: C.warn }}>Finding: ~115M state transitions/day ≈ $2.9k/day just to orchestrate.</div>
+            </div>
+            <div className="rounded-lg p-3" style={{ border: `2px solid ${C.ok}` }}>
+              <div className="mb-2 text-xs font-bold uppercase" style={{ color: C.ok }}>v1.3 — converged</div>
+              <div className="space-y-1.5">
+                <Meter label="Operational" v={5} /><Meter label="Security" v={5} /><Meter label="Reliability" v={5} /><Meter label="Performance" v={5} /><Meter label="Cost" v={4} />
+              </div>
+              <div className="mt-2 text-xs" style={{ color: C.sub }}>Residual cost is channel volume + opt-in LLM — usage, not architecture.</div>
+            </div>
+          </div>
+          <Table head={["Ver", "Change", "Impact"]} rows={iterA} tight />
+          <div className="text-sm" style={{ color: C.sub }}>
+            Stop condition: remaining candidates (Kafka backbone, ElastiCache tier, active-active) parked with explicit adoption triggers — each currently costs more than it returns.
+          </div>
+        </Section>
+
+        <Section id="solB" title="Solution B — streaming platform" kicker="MSK · EKS · Aurora · Redis">
+          <div className="text-sm">
+            Same logical components on Kafka: topics <span style={mono}>ingest → route → channel.* → audit</span> (RF = 3,
+            <span style={mono}> acks=all</span>), keyed <span style={mono}>tenant#recipient</span> — so per-recipient
+            <b> ordering is a guarantee</b> and 7-day <b>replay</b> is an offset reset, not a project. KEDA scales consumer groups on lag over
+            Graviton + ~70% Spot; the inbox lives in Aurora partitioned by day (TTL = <span style={mono}>DROP PARTITION</span>).
+            Resolve-mappings, the resolved-check and the episode guard are <b>the same Router code</b> — only the store client differs.
+          </div>
+          <Table head={["Stage (flow 1, in-app path)", "p50", "p99"]} rows={latencyB} tight />
+          <div className="text-xs" style={{ color: C.sub }}>
+            Email path: ≈ 0.4–1.2 s p99 vs 5 s SLO ✓ (same SES ≥ 600/s quota prerequisite as A). Excluded from steady-state p99 as
+            availability events: consumer rebalance (cooperative-sticky + static membership ⇒ ≤ 2–5 s, deploy-time only) and Aurora
+            failover (≈ 30 s, §12 — Kafka retains, zero loss).
+          </div>
+          <div className="flex flex-wrap gap-x-6 gap-y-1.5">
+            <Meter label="Operational" v={3} /><Meter label="Security" v={5} /><Meter label="Reliability" v={5} /><Meter label="Performance" v={5} /><Meter label="Cost @today" v={3} />
+          </div>
+          <div className="text-sm" style={{ color: C.sub }}>
+            Honest summary: a ≈$3k/mo broker/DB floor plus ≈0.5–1 FTE buys properties A can't match. At today's volume they're mostly unexercised; at ~4–6× the curves cross.
+          </div>
+        </Section>
+
+        <Section id="maps" title="Architecture maps" kicker="component views, tap to switch">
+          <Pick value={arch} set={setArch} opts={[["A", "Solution A · serverless"], ["B", "Solution B · streaming"]]} />
+          {arch === "A" ? <ArchA /> : <ArchB />}
+        </Section>
+
+        <Section id="flows" title="Sequence flows" kicker="5 flows per solution · sequence diagrams in DOCX §5.5 + §10.6 (f1–f6 PNG + .mmd in diagrams.zip)">
+          <div className="flex flex-wrap items-center gap-2">
+            <Pick value={flowSol} set={setFlowSol} opts={[["A", "Solution A"], ["B", "Solution B"]]} />
+            <span className="text-xs" style={{ color: C.sub }}>then pick a flow:</span>
+          </div>
+          <Pick value={flow} set={setFlow} opts={Object.entries(FLOWS[flowSol]).map(([k, v]) => [k, v.label])} />
+          <Seq actors={FLOWS[flowSol][flow].actors} steps={FLOWS[flowSol][flow].steps} />
+          <div className="text-xs" style={{ color: C.sub }}>
+            What changes A→B: SQS message → Kafka record · DynamoDB conditional put → Redis SETNX + Aurora unique constraint ·
+            delete-after-effect → commit-offset-after-effect · BatchWrite → COPY 500 · API GW WS → Redis pub/sub → WS pods.
+            The resolved-check / episode guard is identical in both.
+          </div>
+        </Section>
+
+                <Section id="solA-ddb" title="Why DynamoDB in A, not Aurora?" kicker="DOCX §7.1">
+          <Table head={["Factor", "DynamoDB (A)", "Aurora (B)"]} tight rows={[
+            ["Lambda connections", "SDK call — stateless, no pool, scales linearly", "TCP pool — 10k concurrent Lambdas exhaust Aurora; needs RDS Proxy (+5 ms/call)"],
+            ["Primary access pattern", "PK=tenant#user O(1) — exactly what DDB optimises", "Same OK, but Aurora value is in joins/aggregates not on this hot path"],
+            ["Inbox TTL", "Native expiresAt attribute — zero-ops, lazy, free", "pg_partman partition-drop — one daemon to operate"],
+            ["Write scaling", "On-demand scales in seconds (provisioned-base guard)", "Aurora I/O ceiling; scaling = cluster resize"],
+            ["Multi-AZ failover", "Transparent, zero RTO", "≤30 s failover — acceptable but non-zero"],
+            ["Cost at idle", "≈ $0 on-demand", "Aurora Serverless v2 ≈ $40–60/mo minimum"],
+            ["Admin/aggregate queries", "Routed to Athena/S3 analytical layer", "Rich SQL — one reason B has Aurora for admin surfaces too"],
+          ]} />
+          <div className="text-sm" style={{ color: C.sub }}>
+            Admin aggregates (bulk unread counts, type reconfiguration) are the one DDB tax in A — handled via Athena.
+            Escape hatch if Athena becomes painful: Aurora read replica for admin-only, written by DDB Streams.
+          </div>
+        </Section>
+
+        <Section id="compare" title="A vs B in one screen">
+          <Table head={["Dimension", "A — serverless", "B — streaming"]} rows={compare} tight />
+          <Callout title="Recommendation">
+            Adopt A as v1. Re-platform to B when a trigger fires — the swap is EventBridge+SQS → Kafka behind the Normalizer and Router; producers, adapters, tenancy and APIs move unchanged.
+          </Callout>
+        </Section>
+
+        <Section id="limits" title="Limits & SLO tightness audit" kicker="cold starts · quotas · scale lag · per-channel verdict">
+          <div className="text-sm">
+            A design isn't fast until it survives its own platform's ceilings. Full tables: DOCX §5.8 (A) and §6.4 (B) —
+            including the <b>Solution B latency budget</b> that mirrors A's.
+          </div>
+          <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Solution B — stage budget (in-app path)</div>
+          <Table head={["Stage", "p50", "p99"]} tight rows={latencyB} />
+          <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Solution A — what could bite, and why it doesn't</div>
+          <Table head={["Layer / limit", "Verdict"]} tight rows={[
+            ["Lambda cold start (Normalizer · Router · Inbox writer): ~200–350 ms init", "provisioned-concurrency floor on all three; burst-onset p99 ≤ 0.95 s — 35% headroom, window closes in ~1 min"],
+            ["Concurrency ramp: 1k envs/10 s per fn", "~85 concurrent/stage at 833/s; account raised to 5k; reserved per-fn caps"],
+            ["API GW WS: ~500 new conns/s", "jittered reconnect + full sync on connect — throttle degrades badge, never truth (R8)"],
+            ["DynamoDB: 1k WCU/partition; on-demand ramps to 2× prior peak", "keys spread by tenant#user; provisioned base carries sustained so on-demand only covers the delta (< 2×)"],
+            ["SES sending rate — the one real external ceiling", "burst email ≈ 470/s ⇒ prerequisite: quota ≥ 600/s, alarmed at 80% — pages before it breaches"],
+            ["Slack ~1 msg/s/channel (hard)", "token bucket + Retry-After; task sets no numeric Slack SLO — in-app carries the guarantee"],
+            ["Bedrock quotas / Firehose rec/s", "off SLO path + breaker/budgets · audit batched 25-events/record + loss alarm"],
+          ]} />
+          <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Solution B — scale lag & platform knobs</div>
+          <Table head={["Layer / lag", "Verdict"]} tight rows={[
+            ["Scale lag = B's cold start: KEDA 15–30 s + pod 20–60 s + node 1–2 min", "SLO-path consumers floor-provisioned for FULL burst (~6 pods each ≈ 1,200 rec/s, ≈ $120/mo) — burst needs zero scaling; KEDA elasticity reserved for non-SLO consumers; pause-pods keep a warm node; images pre-pulled"],
+            ["Spot (~70% of fleet), 2-min reclaim", "SLO-path pinned to on-demand nodepool; Spot carries lag-tolerant consumers only"],
+            ["Consumer rebalance pauses", "cooperative-sticky + static membership ⇒ ≤ 2–5 s, deploy-time only — availability event, not steady-state p99"],
+            ["Aurora failover ≈ 30 s", "§12 availability event; Kafka retains everything — costs latency, never data"],
+            ["Kafka partitions / acks=all RTT", "24-way parallelism ≫ need; 5–15 ms per produce priced into the budget; hot recipient serializes on its key — that IS the ordering guarantee"],
+            ["SES · Slack · Bedrock", "identical external caps and the same SES ≥ 600/s prerequisite + 80% alarm"],
+          ]} />
+          <Callout title="Per-channel SLA verdict — both solutions">
+            In-app ≤ 1.5 s: A ≈ 0.6 s warm / ≤ 0.95 s burst-onset ✓ · B ≈ 0.29 s ✓. Email handoff ≤ 5 s: both ✓ — conditional only on the
+            provisioned, alarmed SES quota. Slack: no numeric SLO in the task; provider-capped at ~1/s/channel with per-workspace fairness.
+            AI-enriched: per chosen option; options 2/3 never hold the base SLO hostage. <b>And if B is faster — why A?</b> Past the SLO,
+            speed stops being a feature: 0.3 s vs 0.6 s is imperceptible on a badge, while B's floor cost, ~0.5–1 FTE, slower time-to-first-tenant
+            and cluster-per-cell enterprise story are very perceptible. Choose B for replay, ordering, and unit economics at 4–6× volume — never for speed you can't feel.
+          </Callout>
+        </Section>
+
+        <Section id="inbox" title="Inbox lifecycle rules" kicker="TTL · dismiss · resolution hierarchy · dedup guard">
+          <Table head={["Behavior", "Mechanism"]} rows={[
+            ["TTL", <span key="t">Read path filters <span style={mono}>expiresAt &gt; now</span> — expired items are <b>never visible</b>; storage purge is lazy (DynamoDB TTL). No sweeper fleet. Also the <b>final backstop</b> if every resolve path misses.</span>],
+            ["Read-to-dismiss", <span key="r"><span style={mono}>dismissOnRead</span> per type: mark-read transitions straight to dismissed. One config flag, one branch.</span>],
+            ["Group resolution", <span key="g">Fan-out copies share <span style={mono}>groupKey = tenant#type#entityRef</span>. One resolve → GSI query → batch-clear all N copies + WS <span style={mono}>remove</span>; the read path masks the group until the sweep lands.</span>],
+            ["Resolution hierarchy (A14)", <span key="a"><b>1 · Implicit:</b> resolve-mapping turns the fix event (<span style={mono}>wallet.funds_added</span>) into a resolve — zero producer code. <b>2 · Explicit:</b> the owning service calls the resolve API on \u201Cissue fixed\u201D. <b>3 · Backup:</b> any role recipient via <span style={mono}>POST /v1/inbox/{"{id}"}/resolve</span>. All audited with the principal.</span>],
+            ["Stale-trigger dedup (A15)", <span key="d">Router checks <span style={mono}>ResolutionGroup</span> before delivering: trigger <span style={mono}>eventTime ≤ resolvedAt</span> ⇒ <b>suppressed + audited as dup</b> (the backstop when trigger and fix interleave); later ⇒ genuine re-occurrence ⇒ <b>episode + 1</b> delivered. Resolve before first trigger ⇒ tombstone. No eventTime ⇒ per-type quiet period.</span>],
+            ["Live badge — calculation", <span key="b1"><b>Transition-driven, not counted:</b> +1 rides the item create in <b>one transaction</b> (a retry fails the whole txn ⇒ no double-count); −1 only when a conditional <span style={mono}>unread→read|dismissed|resolved</span> transition <i>wins</i> — racing decrements can't both pass the condition. Expiry: the TTL stream REMOVE with <span style={mono}>oldImage.state=unread</span> decrements (idempotency-marked — the one non-transactional leg). B: Redis counter + Aurora truth = a cross-store ±1 window; a pre-drop aggregate decrements before partition drops.</span>],
+            ["Live badge — reconciliation ladder", <span key="b2"><b>L1 at read time:</b> opening the inbox recounts that user's single partition for pennies and silently overwrites — active users self-heal at the only moment a wrong badge is visible. <b>L2 weekly sweep:</b> dormant accounts only (a daily full recount over ~350 GB buys zero visible correctness). <b>L3 the point:</b> the sweep's drift-rate metric is a <b>bug tripwire</b> — a spike pages (§13.2). The audit trail reconciles <i>daily</i> (§11.2) because compliance reads it even when nobody's looking; a badge only costs at the moment of looking — and L1 owns that moment.</span>],
+          ]} />
+        </Section>
+
+        <Section id="api" title="Public surfaces" kicker="producer · bus mapping · inbox · admin">
+          <Callout title="Security — two trust boundaries (DOCX §9 callout)">
+            <b>1. orgId in the request body</b> must NOT be trusted — a compromised producer could spoof another tenant.
+            tenantId is extracted from the JWT server-side; the body field is validated against that claim or ignored.
+            <b>2. Tenant ID in admin URL</b> (/v1/admin/tenants/{"{id}"}/ai-budget) — the {"{id}"} param must be validated by auth middleware
+            against the caller's JWT. Platform-admins can target any tenant; tenant-admins are constrained to their own tenantId by middleware, not caller trust.
+          </Callout>
+          <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Producer</div>
+          <Code>{`POST /v1/notifications                    → 202 {notifRequestId, duplicate}
+{ "eventId":"pay-run-8812-approval",      // producer idempotency key
+  "typeId":"payroll.approval.required",
+  "recipients":[{"kind":"role","role":"payroll-approver","orgId":"org_912"}],
+  "payload":{"payRunId":"8812","amount":182340},
+  "entityRef":"payrun#8812" }              // seeds groupKey
+
+POST /v1/notifications/resolve            // explicit path — owning service on "issue fixed"
+{ "typeId":"payroll.approval.required","entityRef":"payrun#8812" }`}</Code>
+          <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Bus mappings — notify AND resolve (config, not code; shadow-mode first)</div>
+          <Code>{`{ "action":"notify",
+  "eventPattern":{"detail-type":["wallet.underfunded"]},
+  "typeId":"wallet.underfunded",
+  "fieldMap":{"payload.walletId":"$.detail.walletId",
+              "entityRef":"'wallet#'+$.detail.walletId",
+              "eventTime":"$.detail.occurredAt"},          // powers the episode guard (A15)
+  "recipientSpec":[{"kind":"role","role":"finance-admin","orgId":"$.detail.orgId"},
+                   {"kind":"slackChannel","ref":"#treasury-alerts"}],
+  "status":"shadow" }
+
+// the IMPLICIT resolver — fix event → resolve, zero producer code (A14 primary)
+{ "action":"resolve",
+  "eventPattern":{"detail-type":["wallet.funds_added"]},
+  "typeId":"wallet.underfunded",
+  "fieldMap":{"entityRef":"'wallet#'+$.detail.walletId",
+              "eventTime":"$.detail.occurredAt"},
+  "status":"active" }`}</Code>
+          <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Inbox + live push</div>
+          <Code>{`GET  /v1/inbox?cursor=…      POST /v1/inbox/{id}/read | /dismiss
+POST /v1/inbox/{id}/resolve   // A14 backup: role recipient clears the WHOLE group
+WS →  {"kind":"upsert",item} | {"kind":"remove",reason:"resolved|expired"}
+   |  {"kind":"badge","unread":7}`}</Code>
+          <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Admin — types, templates, mappings, budgets, triage</div>
+          <Code>{`CRUD /v1/admin/types /templates /mappings /org-overrides
+CRUD /v1/admin/tenants/{id}/ai-budget   // A13: same config store as types
+CRUD /v1/admin/ai-triage                // topics[], mode T1–T4, thresholds, budget
+POST /v1/admin/dlq/{queue}/redrive      // one-click, idempotent-safe
+
+{ "tenantId":"org_912", "monthlyTokenCap": 25000000,
+  "perType": {"wallet.underfunded": 2000000}, "onExhaust": "baseline+alert" }`}</Code>
+        </Section>
+
+        <Section id="data" title="Data model — the load-bearing keys">
+          <Table head={["Entity", "What matters"]} rows={entities} />
+          <div className="rounded-lg p-3" style={{ border: `1px solid ${C.line}` }}>
+            <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>PII — where stored & when evicted (DOCX §8.1)</div>
+            <Table head={["Where", "Stored as", "Evicted"]} tight rows={[
+              ["Payload store (DDB, CMK)", "Full payload encrypted; queues carry opaque payloadRef only", "expiresAt = retentionDays (type config) — permanent after that"],
+              ["InboxItem body", "Rendered text may contain PII; tenant CMK encrypted", "Same expiresAt; also on resolve"],
+              ["Enrichment cache", "Masked placeholder form only — zero raw PII", "Per-type cache TTL"],
+              ["Audit trail (S3)", "Recipients as HMAC token; no payload; no body text", "S3 lifecycle = retentionDays; Object Lock optional"],
+              ["Queues · logs · traces", "NEVER — CloudWatch data-protection policy enforces this", "N/A"],
+              ["LLM prompt/response", "Allow-listed masked fields; output never stored; Bedrock no-retention", "Immediate — hash + token counts in audit only"],
+            ]} />
+          </div>
+          <div className="text-sm" style={{ color: C.sub }}>
+            Inbox <span style={mono}>PK = tenant#user</span> makes the read path one Query and makes IAM LeadingKeys isolation possible;
+            the <span style={mono}>groupKey</span> GSI makes group resolution one query + batched updates; <span style={mono}>episode + resolvedAt</span> make
+            stale-trigger dedup a key comparison, not a distributed-systems project.
+          </div>
+        </Section>
+
+        <Section id="ai" title="AI — enrichment & event triage" kicker="storm shields · DB context · rule authoring · registry">
+          <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Enrichment — 3 latency options, each with its storm shield</div>
+          <div className="text-sm" style={{ color: C.sub }}>
+            The failure mode that decides this design is the <b>LLM storm</b>: one upstream incident emits thousands of near-identical
+            events in minutes; a naive integration turns that into thousands of model calls — latency collapse and a five-figure invoice.
+            So every option below states how it survives a storm, not just its happy path.
+          </div>
+          <div className="space-y-2">
+            {aiOptions.map((o) => (
+              <div key={o.n} className="rounded-lg p-3" style={{ border: `1px solid ${o.rec ? C.accent : C.line}`, background: o.rec ? C.accentSoft : C.card }}>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-extrabold" style={{ color: C.navy }}>{o.n}. {o.t}</span>
+                  {o.rec && <Tag tone="accent">recommended</Tag>}
+                </div>
+                <div className="mt-1 text-sm">{o.how}</div>
+                <div className="mt-1 text-xs" style={{ color: C.warn }}><b>Storm shield:</b> {o.storm}</div>
+                <div className="mt-1 text-xs" style={{ color: C.sub }}><b>Degrades / choose when:</b> {o.degrade}</div>
+              </div>
+            ))}
+          </div>
+          <div className="text-sm">
+            Ship <b>2 with 3 layered in front as the cache</b>. Ladder: cache → model → static fallback → baseline — <b>drop is not on the ladder</b>.
+            Guardrails: allow-listed fields, PII masked, temp 0, JSON-schema output, groundedness echo-check, budgets checked
+            <b> before invocation against TenantAiBudget config beside the types (A13)</b> — Bedrock pinned in-region, no data retention.
+            <b> Enriched text complies like any content:</b> it lives inside the InboxItem — tenant CMK, same expiresAt TTL, same visibility
+            rules; the cache stores only the masked placeholder form (PII-free, shared per signature); every enrichment step is audited (Audit tab / §11),
+            prompts/outputs never persisted — hash + token counts only.
+          </div>
+          <div className="rounded-lg p-3" style={{ background: C.wash }}>
+            <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Upgrade semantics — DB truth, email finality, windows</div>
+            <div className="mt-1 text-sm">
+              <b>Yes — the upgrade IS a database write:</b> a conditional <span style={mono}>UPDATE</span> of the InboxItem itself
+              (body v1→v2, <span style={mono}>contentVersion++</span>, <span style={mono}>enrichedAt</span>). The WebSocket upsert only pushes the
+              already-persisted row; open the inbox an hour later and you read v2 from the store, no socket involved.
+            </div>
+            <div className="mt-1 text-sm">
+              <b>Email is immutable — one send, ever.</b> The adapter holds ≤ 4 s for v2 (inside the 5 s handoff); if AI isn't done,
+              the <b>baseline email goes out and is final</b> — no correction email. <b>The inbox keeps its own longer window</b>
+              (<span style={mono}>upgradeWindowMs</span>, default 60 s = the max-age guard): the inbox may still upgrade to v2 after a baseline
+              email left — a stated option-2 trade-off, audited as <span style={mono}>upgraded{"{surface: inbox}"}</span>.
+              After the window: v1 is permanent everywhere, task dropped (<span style={mono}>dropped:max-age</span>), never retried.
+            </div>
+          </div>
+          <div className="rounded-lg p-3" style={{ background: C.wash }}>
+            <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>What the model sees — context is pulled from the DB</div>
+            <div className="mt-1 text-sm">
+              The event alone is too thin to beat the template, so the Enricher assembles its input <b>from the store at enrichment time</b>:
+              always the full payload item fetched by <span style={mono}>payloadRef</span> (queues only carried a reference), plus optional
+              <b> allow-listed context views</b> declared per type in <span style={mono}>aiEnrichment.contextFetch</span> — e.g.
+              <span style={mono}> wallet_context(walletId) → balance, currency, lastTopUps</span>. That's how the model can write
+              "shortfall $12,400 — third top-up gap this month" instead of restating the event.
+            </div>
+            <div className="mt-1 text-xs" style={{ color: C.sub }}>
+              Bounded and off the fast path: ≤ 2 fetches, ≤ 150 ms combined, circuit-broken, Enricher-only (never before baseline ships).
+              Fetched fields pass the same PII allow-list + masking; groundedness verifies outputs against <b>payload ∪ fetched context</b> —
+              pulled data widens what the model may say and exactly what the checker can verify.
+            </div>
+          </div>
+          <div className="pt-1 text-xs font-bold uppercase" style={{ color: C.navy }}>Event triage — 4 budget-friendly options (the AI authors rules, not messages)</div>
+          <div className="text-sm" style={{ color: C.sub }}>
+            AI inspects a <b>configured set of topics</b> and decides notify-or-not, audience, channels. At 5–14M events/day a model per event is unaffordable —
+            so every option below has the LLM emit a <b>BusMapping</b> that the cheap deterministic machinery executes. Constrained to existing type/role/channel
+            vocabulary, shadow-mode by default, origin-tagged, kill switch, platform AiTriageBudget.
+          </div>
+          <div className="space-y-2">
+            {triageOpts.map((o) => (
+              <div key={o.n} className="rounded-lg p-3" style={{ border: `1px solid ${o.rec ? C.accent : C.line}`, background: o.rec ? C.accentSoft : C.card }}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-extrabold" style={{ color: C.navy }}>{o.n} · {o.t}</span>
+                  <Tag tone={o.rec ? "accent" : "navy"}>{o.cost}</Tag>
+                  {o.rec && <Tag tone="ok">ship now</Tag>}
+                </div>
+                <div className="mt-1 text-sm">{o.how}</div>
+                <div className="mt-1 text-xs" style={{ color: C.warn }}><b>Volume / storm shield:</b> {o.storm}</div>
+                <div className="mt-1 text-xs" style={{ color: C.sub }}><b>Watch out:</b> {o.con}</div>
+              </div>
+            ))}
+          </div>
+          <Callout title="Triage recommendation">
+            T1 + T2 together now — both write rules into the existing shadow-mode mapping machinery, inheriting every safeguard already built,
+            for ~$1–30/mo. T4 is the evolution when product wants true real-time triage of never-seen events; T3 fits best as an anomaly-review feed.
+            Every protection layer from enrichment — PII allow-list + masking, no-retention region-pinned Bedrock, budget-before-invoke, full audit —
+            applies to auto-detect <b>by construction</b>, because triage runs through the same pipeline. Open governance items → R11.
+          </Callout>
+          <div className="rounded-lg p-3" style={{ border: `1px solid ${C.line}` }}>
+            <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Sidebar — what a "schema registry" is & why we keep asking for one</div>
+            <div className="mt-1 text-sm">
+              A <b>schema registry</b> is a central, versioned catalog of event contracts: every topic/detail-type has a registered schema,
+              producers must publish schema changes <i>to the registry</i>, and it enforces <b>compatibility rules</b> at publish time —
+              adding an optional field is fine; renaming or removing one that consumers use is <b>rejected in the producer's build</b>.
+              It turns "someone renamed <span style={mono}>walletId</span>" from a silent runtime mystery into a cheap compile-time error.
+            </div>
+            <div className="mt-1 text-xs" style={{ color: C.sub }}>
+              This design leans on it three times: notify/resolve mappings select fields by path, so drift silently breaks notifications AND the
+              implicit resolver (R6); the triage model reads authoritative schemas instead of guessing from samples (better rules);
+              and Solution B has it natively — Glue Schema Registry + Avro on every MSK topic. For Solution A: apply the same registry to the
+              corporate EventBridge bus. Until then: shadow mode + strict templates + hourly canaries remain the runtime tripwires.
+            </div>
+          </div>
+        </Section>
+
+        <Section id="audit" title="Audit — how the requirement is fulfilled" kicker="coverage · trust model · PII · retention">
+          <div className="text-sm">
+            The contract: an <b>immutable, queryable record of every notification's journey</b>, PII never in logs, retention that follows configuration.
+            Full version: DOCX §11.
+          </div>
+          <Table head={["Recorded", "Details"]} rows={[
+            ["Delivery lifecycle", "accepted (incl. duplicate acks) · routed (fan-out size, wave index) · rendered{templateVersion} · per-channel delivered/failed + full SES event stream · suppressed:already-resolved (episode guard) · expired · resolved{principal, path: implicit|api|inbox, episode}"],
+            ["AI enrichment", "requested → cache_hit | budget_denied | context_fetched{views} | invoked{model, tokens} | validated | rejected{reason} | upgraded{surface} | dropped:max-age — prompts/outputs NEVER stored, hash + token counts only"],
+            ["AI triage", "shape_seen · rule_authored{origin:ai-triage} · shadow diffs · promoted{principal} · killed · unclassified — every model-written rule attributable and reversible"],
+            ["Config & ops", "every type/template/mapping/override/budget change (versioned, principal) · DLQ redrives · manual re-renders"],
+          ]} />
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="rounded-lg p-3" style={{ background: C.wash }}>
+              <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Why it can be trusted</div>
+              <div className="mt-1 text-sm">Two planes: <b>authoritative state</b> (DeliveryRecord / InboxItem / ResolutionGroup + 7-day hot index)
+                written in the same step as the side-effect — "what happened to X?" cannot lag; and the <b>analytical trail</b> —
+                idempotent <span style={mono}>auditId = notifId#stage#attempt</span> → Firehose → S3 Parquet (B: audit topic RF=3 → sink).
+                Completeness is <b>verified daily</b>: reconciliation diffs record counts vs trail counts (alarm &gt; 0.1%), and audit-emit
+                failures alarm on any sustained value — the trail fails loud, never silent.</div>
+            </div>
+            <div className="rounded-lg p-3" style={{ background: C.wash }}>
+              <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>PII · retention · immutability</div>
+              <div className="mt-1 text-sm">Audit schema has <b>no payload field</b> (type-enforced + CloudWatch data-protection backstop);
+                recipients as userId / HMAC token. <b>Retention = the config value</b>: retentionDays per type drives the S3 lifecycle on that
+                type's prefix — one knob, no second place to update. Regulated tenants flip on S3 Versioning + <b>Object Lock (compliance)</b>
+                for WORM — an IaC flag, not a redesign. Hot index self-expires at 7 days.</div>
+            </div>
+          </div>
+        </Section>
+
+        <Section id="dr" title="Disaster recovery — 3 options">
+          <Table head={["Option", "RPO / RTO", "Cost", "Watch out"]} rows={drOptions} tight />
+          <div className="text-sm" style={{ color: C.sub }}>
+            Choose 1 now and pre-build its escape hatch (state export + bus-archive replay — cheap, and useful for ops anyway). Producer retries + replay make the <i>effective</i> notification RPO ≈ 0 even in option 1.
+          </div>
+        </Section>
+
+        <Section id="fail" title="What breaks first — and what happens">
+          <Table head={["Failure", "Designed response"]} rows={failures} />
+          <div className="text-sm" style={{ color: C.sub }}>
+            One golden dashboard: ingest vs baseline · per-stage oldest-message-age · per-channel p99 · <b>all DLQ depths (0)</b> · SES event outcomes ·
+            suppressed-as-dup rate · enrichment fallback % + budget burn · top-10 tenants. Every alarm links a runbook; every runbook ends in a replay or redrive that idempotency makes safe.
+          </div>
+        </Section>
+
+        <Section id="adr" title="Two ADRs, condensed">
+          <div className="rounded-lg p-3" style={{ border: `1px solid ${C.line}` }}>
+            <div className="text-sm font-extrabold" style={{ color: C.navy }}>ADR-1 · Choreographed queues, no central orchestrator</div>
+            <div className="mt-1 text-sm">Rejected: Step Functions (≈$2.9k/day at volume + all-channel coupling), sync HTTP fan-out (backpressures the front door), one shared queue (head-of-line + one DLQ kills isolation). Cost: end-to-end state is derived from traces + audit, not stored in one place — accepted, mitigated by the status API.</div>
+          </div>
+          <div className="rounded-lg p-3" style={{ border: `1px solid ${C.line}` }}>
+            <div className="text-sm font-extrabold" style={{ color: C.navy }}>ADR-2 · Pooled tenancy with IAM-enforced keys; silo cells for enterprise</div>
+            <div className="mt-1 text-sm">Rejected: app-level WHERE-clause isolation (one bug = leak, indefensible for payroll), silo-for-all (cost × N + drift), table-per-tenant (limits, no blast-radius win). Cost: a tenant→cell routing layer and per-cell floor for enterprise — priced into that tier.</div>
+          </div>
+        </Section>
+
+        <Section id="risk" title="Ranked risks & open questions" kicker="✦ = closed by decision · R11 new with AI triage">
+          <div className="space-y-2">
+            {risksX.map((r) => (
+              <div key={r.n} className="rounded-lg p-3" style={{ background: C.card, border: `1px solid ${r.st.startsWith("✦") ? C.accent : C.line}` }}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="h-2.5 w-2.5 shrink-0 rounded-full"
+                    style={{ background: r.sev === "High" ? C.accent : r.sev === "Med" ? "#D9A441" : C.line }} />
+                  <span className="text-sm font-extrabold" style={{ color: C.navy }}>R{r.n} · {r.t}</span>
+                  <span className="text-xs font-bold" style={{ color: C.sub }}>{r.sev}</span>
+                  <Tag tone={r.st.startsWith("✦") ? "accent" : "navy"}>{r.st}</Tag>
+                </div>
+                <div className="mt-1.5 text-sm"><b style={{ color: C.navySoft }}>What & why: </b>{r.what}</div>
+                <div className="mt-1 text-sm"><b style={{ color: C.navySoft }}>Decision / mitigation: </b>{r.dec}</div>
+              </div>
+            ))}
+          </div>
+          <div className="text-sm" style={{ color: C.sub }}>
+            Still on the design-review table: R2 (RBAC window sign-off), R6 (bus schema contract — now covering resolve-mappings too),
+            R11's promotion ownership, and the A15 residuals from closing R9 (eventTime producer contract + quiet-period defaults).
+            Everything marked ✦ is closed and reflected in the DOCX (§2 A13–A15, §5.2, §5.4, §6.2, §9, §10.4, §10.6, §11, §15).
+          </div>
+        </Section>
+
+        <footer className="pt-2 text-center text-xs" style={{ color: C.sub }}>
+          Companion to CNS-System-Design.docx (53 pp) — full walkthroughs, iteration logs, cost tables and high-res diagrams live there.
+        </footer>
+      </main>
+    </div>
+  );
+}

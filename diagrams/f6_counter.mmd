@@ -1,0 +1,55 @@
+sequenceDiagram
+    autonumber
+    participant IW as Inbox Writer λ
+    participant DB as InboxItem<br/>(DDB)
+    participant CTR as unread_ctr<br/>(DDB, same PK tenant#user)
+    participant TTL as DDB TTL<br/>(stream REMOVE events)
+    participant REC as Reconciler λ<br/>(weekly)
+    participant API as Inbox API<br/>(read-time L1 fix)
+    participant WS as WebSocket
+    participant DASH as Dashboard<br/>(drift-rate metric)
+
+    Note over IW,CTR: ① CREATE — atomically tied to item birth
+    IW->>DB: TransactWriteItems:<br/>  Put InboxItem {state:unread, notifId}<br/>  CondUpdate tenant#user: ADD unread_ctr +1<br/>  (condition: notifId NOT exists = idempotent guard)
+    DB-->>IW: ok / CondCheck fails on retry (no double-count)
+    IW->>WS: badge = ctr value
+
+    Note over API,CTR: ② READ TRANSITION — conditional decrement
+    API->>DB: CondUpdate InboxItem state:unread→read<br/>(condition: state = unread)
+    alt condition passes — first writer wins
+        DB-->>API: ok
+        API->>CTR: ADD unread_ctr -1
+        Note over CTR: only one writer can pass state=unread check<br/>racing resolve + read: exactly one decrement
+    else already transitioned
+        DB-->>API: ConditionalCheckFailed
+        Note over API: no decrement — idempotent
+    end
+
+    Note over TTL,CTR: ③ TTL EXPIRY — non-transactional leg (the drift risk)
+    TTL->>IW: DDB Stream REMOVE event {oldImage}
+    alt oldImage.state = unread
+        IW->>CTR: ADD unread_ctr -1<br/>(idempotency key: notifId#expiry, TTL 48h)
+        Note over IW: stream is at-least-once<br/>duplicate delivery: idempotency key absorbs it
+    else was read/dismissed/resolved
+        Note over IW: skip — counter already decremented at transition
+    end
+
+    Note over REC,DASH: ④ WEEKLY RECONCILIATION SWEEP (L2 — dormant users)
+    REC->>DB: Scan unread items per tenant#user<br/>(projected: userId COUNT)
+    REC->>CTR: compare scan COUNT vs stored unread_ctr
+    alt match
+        Note over DASH: drift-rate metric += 0
+    else mismatch
+        REC->>CTR: overwrite with scan COUNT
+        DASH->>DASH: drift-rate metric spikes → alarm<br/>"code path broke transition discipline"
+    end
+
+    Note over API,CTR: ⑤ READ-TIME L1 SELF-HEAL (every active user, every open)
+    API->>DB: Query PK=tenant#user (already needed for list)
+    API->>DB: SELECT COUNT visible∧unread on same partition
+    alt differs from stored ctr
+        API->>CTR: overwrite silently
+        DASH->>DASH: L1 correction metric += 1
+    end
+    API-->>API: return {items, unreadCount: corrected value}
+    Note over API: active users self-heal at the exact moment<br/>a wrong badge would be seen — the only moment it matters

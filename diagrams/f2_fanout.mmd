@@ -1,0 +1,42 @@
+sequenceDiagram
+    autonumber
+    participant BUS as Company Event Bus
+    participant EB as EventBridge<br/>(notify + resolve rules)
+    participant N as Normalizer λ
+    participant SQS1 as route-q
+    participant R as Router λ<br/>(resolved-check · RBAC)
+    participant RG as ResolutionGroup<br/>(DDB tenant#groupKey)
+    participant IW as Inbox Writer λ
+    participant DB as InboxItems<br/>(GSI groupKey)
+    participant WS as WebSocket
+
+    Note over BUS,EB: Implicit path — no API GW rate limiter<br/>Rate control: SQS depth + Lambda concurrency cap
+    BUS->>EB: wallet.underfunded {walletId, orgId, occurredAt}
+    EB->>N: notify-mapping matches → envelope + eventTime
+    N->>SQS1: routed (no producer API GW — bus events trusted internal)
+    R->>SQS1: receive
+    R->>RG: GetItem tenant#groupKey
+    alt group already resolved AND eventTime ≤ resolvedAt
+        RG-->>R: tombstone hit
+        Note over R: suppress + audit suppressed:already-resolved
+    else open new episode
+        RG-->>R: none / older episode
+        R->>RG: PutItem episode=1
+        R->>IW: 120 DeliveryTasks (Finance Admins) — paced waves if >5000
+        IW->>DB: BatchWrite 120 items (groupKey shared, state=unread)
+        IW->>DB: ADD unread_ctr +1 per user (TransactWrite per item)
+        IW->>WS: upsert × 120 users
+        Note over IW: audit: routed{fanOutSize:120} + delivered × 120
+    end
+
+    Note over BUS,WS: Later — wallet.funds_added emitted by payments service
+    BUS->>EB: wallet.funds_added {walletId, orgId, occurredAt}
+    EB->>N: resolve-mapping matches (action:resolve)
+    N->>SQS1: resolve envelope
+    R->>SQS1: receive
+    R->>RG: UpdateItem → resolved, resolvedAt=occurredAt, episode closed
+    R->>DB: Query GSI groupKey → 120 items
+    R->>DB: BatchUpdate state=resolved × 120
+    R->>DB: ADD unread_ctr -1 × 120 users (conditional on state was unread)
+    R->>WS: remove × 120 users + badge update
+    Note over R: audit: resolved{principal:implicit-mapping, path:resolve-mapping, episode:1}
