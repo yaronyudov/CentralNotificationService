@@ -2,43 +2,43 @@ sequenceDiagram
     autonumber
     participant P as Producer Service
     participant APIGW as API GW<br/>(HTTP + rate limit)
-    participant N as Normalizer λ<br/>(idempotency · PII→ref)
+    participant IN as Intake λ<br/>(validate · idempotency ·<br/>PII→ref · RBAC · resolved-check)
     participant PS as Payload Store<br/>(DDB encrypted, CMK)
     participant IK as IdempotencyKey<br/>(DDB tenant#eventId TTL 48h)
-    participant SQS1 as route-q
-    participant R as Router λ<br/>(resolved-check · config)
-    participant RBAC as RBAC service
-    participant SQS2 as channel queues<br/>(in-app · email · slack)
-    participant IW as Inbox Writer λ
+    participant SNS as SNS topic<br/>(attrs: channels[] + stage)
+    participant IQ as inbox-q<br/>(filter: inApp)
+    participant MQ as email-q<br/>(filter: email)
+    participant IW as Inbox λ<br/>(render + write)
     participant DB as InboxItem<br/>(DDB tenant#user)
-    participant WS as WebSocket<br/>API GW
+    participant AS as AppSync<br/>(GraphQL subscriptions)
+    participant EM as Email λ<br/>(render + send)
     participant SES as SES
 
     P->>APIGW: POST /v1/notifications {eventId, typeId, recipients, payload}
     Note over APIGW: JWT → tenantId extracted server-side<br/>orgId NOT trusted from body
-    APIGW->>N: validated envelope
-    N->>IK: CondPut tenant#eventId (TTL 48h)
+    APIGW->>IN: validated request
+    IN->>IK: CondPut tenant#eventId (TTL 48h)
     alt duplicate
-        IK-->>N: ConditionalCheckFailed
-        N-->>P: 202 {duplicate:true}
+        IK-->>IN: ConditionalCheckFailed
+        IN-->>P: 202 {duplicate:true}
     else new
-        IK-->>N: ok
-        N->>PS: PutItem payloadRef + encrypted payload
-        N->>SQS1: envelope {notifId, payloadRef, typeId, tenantId}
-        N-->>P: 202 {notifRequestId}
-        Note over N: audit: accepted
-        R->>SQS1: receive batch
-        R->>RBAC: resolve recipients (cached ≤60s, stale ≤10min)
-        RBAC-->>R: userIds[]
-        Note over R: resolved-check: ResolutionGroup episode guard
-        R->>SQS2: DeliveryTask × recipient × channel
-        Note over R: audit: routed {fanOutSize}
-        IW->>SQS2: receive in-app tasks
+        IK-->>IN: ok
+        IN->>PS: PutItem payloadRef + encrypted payload
+        Note over IN: RBAC resolve (cached ≤60s)<br/>resolved-check: episode guard
+        IN->>SNS: publish envelope<br/>attrs: channels=[inApp,email], stage=deliver
+        IN-->>P: 202 {notifRequestId}
+        Note over IN: audit: accepted — publish-before-ack
+        SNS->>IQ: filter channels ∋ inApp
+        SNS->>MQ: filter channels ∋ email
+        IQ->>IW: receive batch
+        Note over IW: render in-app template<br/>(Mustache-strict)
         IW->>DB: TransactWrite: PutItem(state=unread) + ADD unread_ctr +1
         Note over IW: conditional on notifId absence — idempotent
-        IW->>WS: postToConnection upsert + badge
-        WS-->>P: user sees notification (p99 ≤ 1.5s)
+        IW->>AS: publishInboxEvent (IAM mutation)
+        AS-->>P: subscriber sees notification (p99 ≤ 1.5s)
         Note over IW: audit: delivered{channel:inapp}
-        IW->>SES: via email-adapter queue → outbox → send
-        Note over IW: audit: delivered{channel:email} on SES event
+        MQ->>EM: receive batch
+        Note over EM: render email template → outbox → SES v2
+        EM->>SES: send (X-CNS-Notif-Id)
+        Note over EM: audit: delivered{channel:email} on SES event
     end

@@ -1,18 +1,18 @@
 sequenceDiagram
     autonumber
-    participant IW as Inbox Writer λ
+    participant IW as Inbox λ
     participant DB as InboxItem<br/>(DDB)
     participant CTR as unread_ctr<br/>(DDB, same PK tenant#user)
     participant TTL as DDB TTL<br/>(stream REMOVE events)
     participant REC as Reconciler λ<br/>(weekly)
-    participant API as Inbox API<br/>(read-time L1 fix)
-    participant WS as WebSocket
+    participant API as AppSync resolvers<br/>(read-time L1 fix)
+    participant AS as AppSync<br/>(subscriptions)
     participant DASH as Dashboard<br/>(drift-rate metric)
 
     Note over IW,CTR: ① CREATE — atomically tied to item birth
     IW->>DB: TransactWriteItems:<br/>  Put InboxItem {state:unread, notifId}<br/>  CondUpdate tenant#user: ADD unread_ctr +1<br/>  (condition: notifId NOT exists = idempotent guard)
     DB-->>IW: ok / CondCheck fails on retry (no double-count)
-    IW->>WS: badge = ctr value
+    IW->>AS: publishInboxEvent BADGE = ctr value
 
     Note over API,CTR: ② READ TRANSITION — conditional decrement
     API->>DB: CondUpdate InboxItem state:unread→read<br/>(condition: state = unread)
@@ -45,7 +45,7 @@ sequenceDiagram
     end
 
     Note over API,CTR: ⑤ READ-TIME L1 SELF-HEAL (every active user, every open)
-    API->>DB: Query PK=tenant#user (already needed for list)
+    API->>DB: Query PK=tenant#user (already needed for inbox query)
     API->>DB: SELECT COUNT visible∧unread on same partition
     alt differs from stored ctr
         API->>CTR: overwrite silently

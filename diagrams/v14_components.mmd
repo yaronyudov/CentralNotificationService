@@ -1,0 +1,54 @@
+flowchart LR
+    subgraph Producers
+        P[Product services<br/>explicit API]
+        BUS[Company event bus<br/>notify + resolve rules]
+    end
+
+    APIGW[API GW HTTP<br/>auth + rate limit]
+    EB[EventBridge rules<br/>from mapping config]
+    IN["Intake λ<br/>validate · idempotency ·<br/>payload→ref · RBAC resolve ·<br/>resolved-check"]
+    SNS{{"SNS topic<br/>attrs: channels[] + stage"}}
+
+    EQ[["enrich-q<br/>stage=enrich<br/>⟵ AI messages WAIT"]]
+    EN["Enricher λ<br/>cache · budget · mask ·<br/>Bedrock · validate"]
+    LLM[Bedrock<br/>Haiku · temp 0 · no retention]
+
+    IQ[[inbox-q]]
+    MQ[[email-q]]
+    SQ[[slack-q]]
+    IW["Inbox λ<br/>render + write"]
+    EM["Email λ<br/>render + send"]
+    SL["Slack λ<br/>render + post"]
+
+    DB[(DynamoDB<br/>InboxItem · groups ·<br/>config · budgets)]
+    AS[AppSync GraphQL<br/>queries · mutations ·<br/>subscriptions]
+    SES[SES]
+    SLK[Slack API]
+    U[User<br/>Bell inbox]
+    AUD[(Audit<br/>Firehose→S3→Athena)]
+    DLQ[[DLQs per queue<br/>alarm at depth ≥ 1]]
+
+    P --> APIGW --> IN
+    BUS --> EB --> IN
+    IN --> SNS
+    SNS -- stage=enrich --> EQ --> EN
+    EN <--> LLM
+    EN -- "republish stage=deliver" --> SNS
+    SNS -- inApp --> IQ --> IW
+    SNS -- email --> MQ --> EM
+    SNS -- slack --> SQ --> SL
+    IW --> DB
+    IW -- publish --> AS
+    AS -- subscription + queries --> U
+    AS -. direct JS resolvers .-> DB
+    EM --> SES
+    SL --> SLK
+    IN -.-> AUD
+    EN -.-> AUD
+    IW -.-> AUD
+    EM -.-> AUD
+    SL -.-> AUD
+    EQ -.-> DLQ
+    IQ -.-> DLQ
+    MQ -.-> DLQ
+    SQ -.-> DLQ
