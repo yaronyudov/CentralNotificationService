@@ -59,7 +59,7 @@ Six channels ship in v1.4: **in-app, email, Slack** (original) and **webhook, mo
 
 ![Component overview](../diagrams/v14_components.png)
 
-**Sequence diagrams** (sources in [`../diagrams/`](../diagrams/)): `f1_explicit` (explicit single-user), `f2_fanout` (bus fan-out + implicit resolve), `f3_enrichment` (the AI gate), `f4_inbox` (AppSync read/resolve), `f5_triage` (AI event triage), `f6_counter` (unread-counter ladder), `f7_webhook`, `f8_push`, `f9_sms` (the three new channels, §3.6), `f10_login_to_inbox` (full flow: login → JWT → subscribe → device register → notification → Bell, §7), and `f11_resolve_race` (fan-out resolved mid-flight — a recipient is **never** notified, §7).
+**Sequence diagrams** (sources in [`../diagrams/`](../diagrams/)): `f1_explicit` (explicit single-user), `f2_fanout` (bus fan-out + implicit resolve), `f3_enrichment` (the AI gate), `f4_inbox` (AppSync read/resolve), `f5_triage` (AI event triage), `f6_counter` (unread-counter ladder), `f7_webhook`, `f8_push`, `f9_sms` (the three new channels, §3.6), `f10_login_to_inbox` (full flow: login → JWT → subscribe → device register → notification → Bell, §7), `f11_resolve_race` (fan-out resolved mid-flight — a recipient is **never** notified, §7), and `f12_webhook_admin` (tenant admin panel: delivery visibility + replay by single message / time-frame / filtered type, §3.6.5).
 
 ### 3.1 Intake λ — the only place events enter
 
@@ -140,7 +140,7 @@ enum InboxEventKind { UPSERT REMOVE BADGE }   # REMOVE reason: resolved | expire
 
 - **Config store:** `NotificationType`, templates (versioned, draft→shadow→active), bus mappings (notify/resolve, shadow-mode first), org overrides, `TenantAiBudget`. Admin API is internal OIDC, every write versioned + cache-busting, exactly as v1.3 §9.4.
 - **Audit:** dual-plane, unchanged from v1.3 §11 — authoritative state written with the side-effect it describes; analytical trail (idempotent `auditId = notifId#stage#attempt`) via Firehose → S3 Parquet + Athena, 7-day hot index; daily reconciliation with drift alarm; PII never in the trail. New v1.4 audit events for the AI gate: `enrich_waiting`, `enrich_retry{reason,attempt}`, `enrich_dlq{reason}`, `redriven`.
-- **Observability:** golden dashboard — ingest rate, per-queue oldest-message-age, per-channel success and delivery p99, **all DLQ depths (steady state 0)**, enrichment retry/DLQ rate and budget burn, AppSync connection/publish errors, SES bounce/complaint, per-endpoint webhook health, push token-invalidation rate, SMS opt-out and spend, top-10 tenants by volume.
+- **Observability:** golden dashboard — ingest rate, per-queue oldest-message-age, per-channel success and delivery p99, **all DLQ depths (steady state 0)**, enrichment retry/DLQ rate and budget burn, AppSync connection/publish errors, SES bounce/complaint, per-endpoint webhook health, push token-invalidation rate, SMS opt-out and spend, top-10 tenants by volume. The **tenant-facing** webhook panel (§3.6.5) is a scoped read over this same audit data. New audit events for replay: `replay_requested{selection, count, principal}`, `webhook_replayed`, `replay_skipped:expired`.
 
 ### 3.6 Channel catalog — email, Slack, in-app, and the three new adapters
 
@@ -289,6 +289,46 @@ The most expensive and most regulated channel — reserved for high-priority typ
 
 ---
 
+#### 3.6.5 Webhook delivery visibility & replay (the tenant admin panel)
+
+Once a tenant is receiving webhooks they need to answer two operational questions themselves: *"what did CNS send me, and what failed?"* and *"re-send me the ones I missed."* Both are served from data CNS **already captures** — the per-attempt audit events and the `DeliveryRecord` outbox — so this is a read/re-enqueue feature, not new storage. Full flow: diagram [`f12_webhook_admin`](../diagrams/f12_webhook_admin.png).
+
+**A. Visibility — what the tenant sees.** All tenant-scoped (JWT pins them to their own `tenantId`), read from the **7-day hot audit index** (DynamoDB) for the live panel and **Athena over S3 Parquet** for older windows (partitioned `dt/type/tenant`, which is exactly the shape these filters need):
+
+- **Per-endpoint rollups / calculations:** `sent`, `delivered`, `failed`, `suppressed`; **success rate**; **p50/p99 latency**; HTTP **status-code breakdown**; volume by `typeId`; current `breakerState` and `consecutiveFailures`; last-delivery timestamp — over any `from`/`to` window.
+- **Delivery log:** one row per attempt — `notifId`, `typeId`, timestamp, `httpStatus`, latency, `attempt`, outcome (`delivered | failed | suppressed | replayed`), and the failure `reason` — searchable and filterable by endpoint, type, status, and time range, cursor-paginated.
+- **Single-delivery drill-in:** every attempt for one `notifId` plus the response code.
+
+```
+GET /v1/admin/webhooks/{id}/stats?from&to                       # rollups / calculations
+GET /v1/admin/webhooks/{id}/deliveries?from&to&type&status&cursor  # delivery log (filterable)
+GET /v1/admin/webhooks/{id}/deliveries/{notifId}                # single-delivery detail
+```
+
+**B. Replay — one message, a whole time-frame, or a filtered time-frame.** The same three selection modes the requirement asks for, all through one endpoint:
+
+```
+POST /v1/admin/webhooks/{id}/replay
+  { "notifId": "3f9c…" }                                        # ① a single message
+  { "from": "...", "to": "..." }                                # ② a whole time-frame
+  { "from": "...", "to": "...",                                 # ③ filtered time-frame
+    "types": ["walletX","walletY"], "excludeTypes": ["walletZ"],
+    "status": "failed", "dryRun": true }                        # e.g. only X,Y — not Z — that failed
+```
+
+Mechanics, kept deliberately simple by reusing what already exists:
+
+1. **Resolve the selection** against the audit index/Athena into a concrete set of `notifId`s.
+2. **Dry-run first** (`dryRun:true`, the default for a range) returns the **count + a sample** and sends nothing — so an operator never fires a 200k-message replay blind.
+3. On confirm, CNS **enqueues replay tasks onto `webhook-q`** in **paced waves** (the same pacing as a large fan-out), each tagged `replayId` + `X-CNS-Replay: true`.
+4. The `Webhook λ` **re-renders from the pinned `templateVersion`** (R10) and the payload fetched by `payloadRef`, **re-signs with the *current* credentials** (bearer + HMAC), and POSTs — through the *same* SSRF guard, retry, breaker, and DLQ path as a first delivery.
+5. **Idempotent by construction:** the consumer keys on `notifId`, so replaying something it already processed is a safe no-op on their side; replaying something it missed delivers it.
+6. If the payload is **past its retention/TTL**, replay is unavailable for that item and is audited `replay_skipped:expired` — the panel shows it as un-replayable rather than failing silently.
+
+Replay is a deliberate admin action, so it **bypasses the resolved-check** by default (you asked for these to be re-sent); a `respectResolution:true` flag honors suppression if the tenant prefers. Every replay is audited (`replay_requested{selection, count, principal}`, `webhook_replayed`), so "who re-sent what, and when" is one query. The same visibility+replay surface generalizes to other channels, but ships webhook-first because that's where tenants integrate programmatically.
+
+---
+
 ## 4. AI enrichment — the gate
 
 > **Requirement (v1.4):** an AI-enriched notification **waits in the AI pipeline** and is **not sent to the client** until enrichment completes. There is no baseline-first delivery.
@@ -419,6 +459,9 @@ POST /v1/admin/webhooks/{id}/rotate-token   rotate the Authorization: Bearer tok
      { "overlapHours": 48 }                 optional per-rotation overlap; both default to 48h
 GET  /v1/admin/webhooks/{id}/credentials    masked current + previous of BOTH secrets, *RotatedAt,
                                             overlap expiry — the admin-panel rotation view
+GET  /v1/admin/webhooks/{id}/stats          delivery rollups / calculations (§3.6.5)
+GET  /v1/admin/webhooks/{id}/deliveries     filterable delivery log (from/to/type/status)
+POST /v1/admin/webhooks/{id}/replay         replay a single message / time-frame / filtered set
 POST /v1/admin/webhooks/{id}/enable         clear the breaker after a fix
 CRUD /v1/admin/tenants/{id}/sms-budget      per-tenant SMS spend/rate cap (TenantAiBudget pattern)
 ```
