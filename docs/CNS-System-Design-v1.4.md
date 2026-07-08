@@ -291,13 +291,14 @@ The most expensive and most regulated channel — reserved for high-priority typ
 
 #### 3.6.5 Webhook delivery visibility & replay (the tenant admin panel)
 
-Once a tenant is receiving webhooks they need to answer two operational questions themselves: *"what did CNS send me, and what failed?"* and *"re-send me the ones I missed."* Both are served from data CNS **already captures** — the per-attempt audit events and the `DeliveryRecord` outbox — so this is a read/re-enqueue feature, not new storage. Full flow: diagram [`f12_webhook_admin`](../diagrams/f12_webhook_admin.png).
+Tenants need to answer two operational questions themselves: *"what did CNS send me, and what failed?"* and *"re-send me the ones I missed."* These are **two different data planes with two different retention and PII profiles**, and conflating them is a bug — the earlier draft did, so this section is explicit about it. Full flow: diagram [`f12_webhook_admin`](../diagrams/f12_webhook_admin.png).
 
-**A. Visibility — what the tenant sees.** All tenant-scoped (JWT pins them to their own `tenantId`), read from the **7-day hot audit index** (DynamoDB) for the live panel and **Athena over S3 Parquet** for older windows (partitioned `dt/type/tenant`, which is exactly the shape these filters need):
+> **The correction.** Visibility reads the **PII-free audit trail** (metadata only). Replay must re-send the **exact bytes originally delivered**, so it reads a separate **`WebhookDeliveryArtifact` store** — *not* the audit trail (which has no payload by design) and *not* by re-rendering from the payload store (re-rendering is a *reconstruction*, not a replay: templates, config, or context may have changed, and it would re-read PII from the payload store). **The renderer never runs during replay.**
 
-- **Per-endpoint rollups / calculations:** `sent`, `delivered`, `failed`, `suppressed`; **success rate**; **p50/p99 latency**; HTTP **status-code breakdown**; volume by `typeId`; current `breakerState` and `consecutiveFailures`; last-delivery timestamp — over any `from`/`to` window.
-- **Delivery log:** one row per attempt — `notifId`, `typeId`, timestamp, `httpStatus`, latency, `attempt`, outcome (`delivered | failed | suppressed | replayed`), and the failure `reason` — searchable and filterable by endpoint, type, status, and time range, cursor-paginated.
-- **Single-delivery drill-in:** every attempt for one `notifId` plus the response code.
+**A. Visibility — metadata only, PII-free, long-retained.** Tenant-scoped (JWT pins them to their own `tenantId`). Served from the audit plane, which by contract carries **no payload and no body** — only `notifId`, `typeId`, timestamps, `httpStatus`, latency, `attempt`, outcome, `reason`, and HMAC-tokenized identifiers. The 7-day DynamoDB **hot index is only a query-speed cache**; older windows are served transparently from **Athena over S3 Parquet** (partitioned `dt/type/tenant`), retained for the type's `retentionDays` (e.g. 365 d). So **"what failed 50 days ago" is fully visible** — status, latency, reason, everything except the body.
+
+- **Rollups / calculations:** `sent`, `delivered`, `failed`, `suppressed`; success rate; p50/p99 latency; HTTP status-code breakdown; volume by `typeId`; `breakerState`; last-delivery — over any window.
+- **Delivery log:** one row per attempt, filterable by endpoint/type/status/time; each row carries a `replayable` flag (see D).
 
 ```
 GET /v1/admin/webhooks/{id}/stats?from&to                       # rollups / calculations
@@ -305,7 +306,21 @@ GET /v1/admin/webhooks/{id}/deliveries?from&to&type&status&cursor  # delivery lo
 GET /v1/admin/webhooks/{id}/deliveries/{notifId}                # single-delivery detail
 ```
 
-**B. Replay — one message, a whole time-frame, or a filtered time-frame.** The same three selection modes the requirement asks for, all through one endpoint:
+**B. The `WebhookDeliveryArtifact` store — what a real replay re-sends.** At first delivery the `Webhook λ` persists the **exact rendered request body it sent** (the signed bytes), keyed by `notifId`, so replay is a verbatim re-send, not a reconstruction. Because that body *is* the notification content, it can contain PII — so this store is **nothing like the audit trail**:
+
+```jsonc
+// WebhookDeliveryArtifact — the sent bytes, encrypted, with its own TTL
+{ "PK": "tenant#org_912", "SK": "artifact#<notifId>",
+  "body": "<tenant-CMK-encrypted exact rendered bytes>",   // envelope-encrypted, per-tenant CMK
+  "contentType": "application/json", "templateVersion": 7,
+  "renderedAt": "2026-07-08T…", "thin": false,             // thin webhooks store a PII-free stub
+  "expiresAt": "<TTL = replayRetentionDays>" }             // separate knob from audit retention
+```
+
+- **PII posture:** tenant-tier **CMK-encrypted at rest**, tenant-prefixed keys with IAM isolation, honors GDPR erasure, and **auto-purged at `replayRetentionDays`** (DynamoDB TTL; S3 + SSE-KMS with a lifecycle rule is the escape hatch when volume or a long window makes DynamoDB storage the wrong tool). It is **not** in the PII-free audit lake and is never queried by Athena.
+- **Thin webhooks** (`thin:true`, §3.6.1-D) carry no PII in the body, so their artifact is PII-free and can be retained cheaply and long.
+
+**C. Replay — one message, a whole time-frame, or a filtered time-frame.** Same three selection modes, one endpoint:
 
 ```
 POST /v1/admin/webhooks/{id}/replay
@@ -316,16 +331,15 @@ POST /v1/admin/webhooks/{id}/replay
     "status": "failed", "dryRun": true }                        # e.g. only X,Y — not Z — that failed
 ```
 
-Mechanics, kept deliberately simple by reusing what already exists:
+1. **Resolve the selection** against the audit metadata into a set of `notifId`s (Athena for old windows — works for 50 days back).
+2. **Dry-run first** returns count + sample **and how many are still `replayable`** vs. expired — nothing is sent.
+3. On confirm, enqueue replay tasks onto `webhook-q` in **paced waves**, tagged `replayId` + `X-CNS-Replay: true`.
+4. The `Webhook λ` **loads the stored artifact and re-sends the bytes verbatim** — *no render, no payload-store read*. Only the **transport envelope is refreshed**: `Authorization: Bearer <current token>`, `X-CNS-Signature` recomputed over `{fresh-timestamp}.{stored-body}` with the current HMAC secret (a fresh timestamp is required so the consumer's own replay-window check passes), same `X-CNS-Notif-Id`. Content is identical; only auth/timestamp are current.
+5. **Idempotent by construction:** the consumer keys on `notifId`, so replaying something already processed is a safe no-op; replaying something missed delivers it.
 
-1. **Resolve the selection** against the audit index/Athena into a concrete set of `notifId`s.
-2. **Dry-run first** (`dryRun:true`, the default for a range) returns the **count + a sample** and sends nothing — so an operator never fires a 200k-message replay blind.
-3. On confirm, CNS **enqueues replay tasks onto `webhook-q`** in **paced waves** (the same pacing as a large fan-out), each tagged `replayId` + `X-CNS-Replay: true`.
-4. The `Webhook λ` **re-renders from the pinned `templateVersion`** (R10) and the payload fetched by `payloadRef`, **re-signs with the *current* credentials** (bearer + HMAC), and POSTs — through the *same* SSRF guard, retry, breaker, and DLQ path as a first delivery.
-5. **Idempotent by construction:** the consumer keys on `notifId`, so replaying something it already processed is a safe no-op on their side; replaying something it missed delivers it.
-6. If the payload is **past its retention/TTL**, replay is unavailable for that item and is audited `replay_skipped:expired` — the panel shows it as un-replayable rather than failing silently.
+**D. The 50-days question — visibility and replay decouple.** Metadata visibility follows `retentionDays` (long — you can *see* a 90-day-old failure). Replayability follows `replayRetentionDays` (a separate, deliberately-chosen knob, default e.g. 30 d). If the artifact has aged out, the delivery is still **visible** but its row is marked **`replayable:false`** and a replay attempt is audited `replay_skipped:expired` — never a silent failure. **To replay 50-day-old messages, set `replayRetentionDays ≥ 50`** — and accept the tradeoff that this **keeps PII-bearing bodies encrypted-at-rest for longer**, enlarging the GDPR/erasure surface and storage cost. That is a governance decision, surfaced as one config knob per type/endpoint, not an accident. (Thin webhooks sidestep the tradeoff entirely.)
 
-Replay is a deliberate admin action, so it **bypasses the resolved-check** by default (you asked for these to be re-sent); a `respectResolution:true` flag honors suppression if the tenant prefers. Every replay is audited (`replay_requested{selection, count, principal}`, `webhook_replayed`), so "who re-sent what, and when" is one query. The same visibility+replay surface generalizes to other channels, but ships webhook-first because that's where tenants integrate programmatically.
+Replay is a deliberate admin action, so it **bypasses the resolved-check** by default; a `respectResolution:true` flag honors suppression instead. Every replay is audited (`replay_requested{selection, count, principal}`, `webhook_replayed`, `replay_skipped:expired`). The same split (PII-free metadata plane + encrypted artifact plane) generalizes to other channels, but ships webhook-first because that's where tenants integrate programmatically.
 
 ---
 
@@ -408,6 +422,7 @@ Unchanged from v1.3 §10.6 (T1 design-time author + T2 signature-gated runtime r
 | **`WebhookEndpoint`** (new) | `PK tenant#endpointId` · `url`, **`secretRef` (HMAC) + `bearerTokenRef` — two independently rotatable credentials, each with a `current`/`previous` overlap** (`rotationOverlapHours`, `secretRotatedAt`, `bearerRotatedAt`), `subscribedTypes[]`, `status(pending\|active\|disabled)`, `breakerState`, `consecutiveFailures`, `customHeaders`, `mTLS`, `verifiedAt` — §3.6.1 |
 | **`DeviceToken`** (new) | `PK tenant#user`, `SK device#id` · `platform(ios\|android\|web)`, `token`, `appVersion`, `locale`, `active`, `lastSeenAt` — pruned on provider "unregistered" — §3.6.2 |
 | **`SmsConsent`** (new) | `PK tenant#user` (or `phone#hash`) · `status(opted_in\|opted_out)`, `source`, `updatedAt` — STOP/HELP driven suppression — §3.6.3 |
+| **`WebhookDeliveryArtifact`** (new) | `PK tenant#endpointId`, `SK artifact#notifId` · the **exact sent bytes**, **tenant-CMK-encrypted**, `templateVersion`, `thin`, `expiresAt` TTL = **`replayRetentionDays`** — the verbatim source for replay; separate from the PII-free audit trail — §3.6.5 |
 | `NotificationType.channels` enum | gains **`webhook`, `push`, `sms`** with per-channel settings (`push.contentPolicy`, `push.collapseKey`, `push.ttl`, `sms.contentPolicy`, `sms.maxSegments`, `sms.senderIdPolicy`, webhook via tenant endpoint registry) |
 | Recipient kinds | `user`, `role`, `externalEmail`, `slackChannel` **+ `externalPhone`** (SMS to a non-user number) |
 
@@ -497,7 +512,7 @@ Retry policy per boundary: full-jitter exponential backoff everywhere; DLQ after
 ## 8. Multi-tenancy, security, DR — kept, summarized
 
 - **Standard tier:** pooled, every key tenant-prefixed, isolation enforced below app code (DynamoDB `LeadingKeys`-conditioned roles; AppSync resolvers build keys from JWT claims only). **Enterprise tier:** same IaC stack stamped as a dedicated cell.
-- **PII:** payload-by-reference; only Intake and channel λs ever hold plaintext; Bedrock no-retention + allow-listed masked prompts; logger schema without payload fields + CloudWatch data-protection backstop.
+- **PII:** payload-by-reference; only Intake and channel λs ever hold plaintext; Bedrock no-retention + allow-listed masked prompts; logger schema without payload fields + CloudWatch data-protection backstop. The **audit trail is PII-free** (metadata + tokenized ids only); the two stores that *do* hold PII — the payload store and the `WebhookDeliveryArtifact` store (§3.6.5) — are tenant-CMK-encrypted, IAM-isolated, TTL-purged (`retentionDays` / `replayRetentionDays`), and honor erasure. Replay reads the artifact store, never the audit trail.
 - **DR:** Multi-AZ single region (all components ≥ 2 AZ by construction); IaC redeployable cross-region; config/templates continuously exported; EventBridge archive enables re-ingest of an outage window. Warm-standby / active-active remain priced options with the same triggers as v1.3 §12.
 
 ---

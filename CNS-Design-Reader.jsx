@@ -390,22 +390,24 @@ const FLOWS = {
   },
   f12: {
     label: "12 · Webhook admin — visibility + replay",
-    actors: ["Admin", "Admin API", "Audit index", "webhook-q", "Webhook λ", "Endpoint"],
+    actors: ["Admin", "Admin API", "Audit (PII-free)", "Artifact store", "webhook-q", "Webhook λ", "Endpoint"],
     steps: [
-      { note: "① VISIBILITY — a read view over audit data CNS already captures (no new store)" },
+      { note: "① VISIBILITY — metadata only, PII-FREE, long-retained (50 days is fine)" },
       { f: 0, t: 1, label: "GET /webhooks/{id}/stats?from&to" },
-      { f: 1, t: 2, label: "hot index (7d) + Athena (older, partitioned dt/type/tenant)" },
+      { f: 1, t: 2, label: "7d hot index = speed cache · older → Athena/S3 (retentionDays)" },
       { f: 1, t: 0, label: "sent · delivered · failed · success% · p50/p99 · status-code breakdown", dashed: true },
       { f: 0, t: 1, label: "GET /webhooks/{id}/deliveries?from&to&type&status" },
-      { f: 1, t: 0, label: "per-attempt log: notifId · type · httpStatus · latency · outcome · reason", dashed: true },
-      { note: "② REPLAY — {notifId} | {from,to} | {from,to, types:[X,Y], excludeTypes:[Z], status:failed}" },
+      { f: 1, t: 0, label: "per-attempt rows: notifId · type · status · latency · outcome · replayable? (NO body)", dashed: true },
+      { note: "② REPLAY — re-send the EXACT bytes: no render · not from audit · not from DB payload" },
+      { note: "selection: {notifId} | {from,to} | {from,to, types:[X,Y], excludeTypes:[Z], status:failed}" },
       { f: 0, t: 1, label: "POST /replay {…selection…, dryRun:true}" },
-      { f: 1, t: 0, label: "DRY-RUN: count + sample (nothing sent yet)", dashed: true },
+      { f: 1, t: 0, label: "DRY-RUN: count + how many still replayable vs expired (nothing sent)", dashed: true },
       { f: 0, t: 1, label: "POST /replay {…selection…, dryRun:false} — confirm" },
-      { f: 1, t: 3, label: "enqueue replay tasks — paced · replayId · idempotent notifId" },
-      { f: 3, t: 4, label: "receive" },
-      { f: 4, t: 5, label: "re-render (PINNED templateVersion) + re-sign (current creds) + POST X-CNS-Replay", tone: "accent" },
-      { note: "idempotent on notifId ⇒ safe to double-replay · payload past retention ⇒ audited replay_skipped:expired" },
+      { f: 1, t: 4, label: "enqueue replay tasks — paced · replayId · idempotent notifId" },
+      { f: 4, t: 5, label: "receive" },
+      { f: 5, t: 3, label: "load stored artifact (exact sent bytes, CMK-decrypted)" },
+      { f: 5, t: 6, label: "re-send VERBATIM — refresh transport only (current bearer + fresh-ts HMAC + X-CNS-Replay)", tone: "accent" },
+      { note: "artifact aged out (> replayRetentionDays) ⇒ still VISIBLE but replayable:false, audit replay_skipped:expired" },
     ],
   },
 };
@@ -441,6 +443,7 @@ const entities = [
   ["WebhookEndpoint (new)", "tenant#endpointId · url · secretRef (HMAC) + bearerTokenRef — two independently rotatable creds, each current+previous overlap (rotationOverlapHours, *RotatedAt) · subscribedTypes[] · status(pending|active|disabled) · breakerState · mTLS — §3.6.1"],
   ["DeviceToken (new)", "tenant#user · device#id · platform(ios|android|web) · token · appVersion · locale · active — pruned on provider 'unregistered' — §3.6.2"],
   ["SmsConsent (new)", "tenant#user (or phone#hash) · status(opted_in|opted_out) · source · updatedAt — STOP/HELP driven suppression — §3.6.3"],
+  ["WebhookDeliveryArtifact (new)", "tenant#endpointId · artifact#notifId · the EXACT sent bytes, tenant-CMK-encrypted · templateVersion · thin · expiresAt=replayRetentionDays — verbatim replay source, NOT the PII-free audit trail — §3.6.5"],
   ["Recipient kinds", "user · role · externalEmail · slackChannel + externalPhone (SMS to a non-user number)"],
   ["Connection (v1.3)", "DELETED — AppSync owns connection state; there is nothing for CNS to store"],
 ];
@@ -796,29 +799,42 @@ export default function App() {
         </Section>
 
         <Section id="webhookops" title="Webhook visibility & replay" kicker="tenant admin panel — what was sent/failed + re-send by message / time-frame / filter">
-          <div className="text-sm">
-            The tenant answers two operational questions itself: <b>“what did CNS send me, and what failed?”</b> and <b>“re-send the ones I missed.”</b>
-            Both are served from data CNS <b>already captures</b> (per-attempt audit events + the outbox) — a scoped read + a re-enqueue, <b>not</b> new storage.
-          </div>
+          <Callout title="Two data planes — do not conflate them (the correction)">
+            <b>Visibility</b> reads the <b>PII-free audit trail</b> (metadata only — no body). <b>Replay</b> re-sends the <b>exact bytes originally delivered</b>,
+            read from a separate <span style={mono}>WebhookDeliveryArtifact</span> store — <b>NOT</b> the audit trail (it has no payload by design), and <b>NOT</b> by
+            re-rendering from the DB payload (that's a <i>reconstruction</i>, not a replay, and would re-read PII). <b>The renderer never runs during replay.</b>
+          </Callout>
           <div className="grid gap-2 sm:grid-cols-2">
             <div className="rounded-lg p-3" style={{ background: C.wash }}>
-              <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Visibility — the calculations</div>
-              <div className="mt-1 text-sm">Per-endpoint over any <span style={mono}>from</span>/<span style={mono}>to</span>: <b>sent · delivered · failed · suppressed</b>,
-                <b> success rate</b>, <b>p50/p99 latency</b>, HTTP <b>status-code breakdown</b>, volume by type, breaker state. Plus a filterable
-                <b> delivery log</b> (one row per attempt: notifId · type · status · latency · outcome · reason). Last 7 days from the hot index; older from Athena.</div>
+              <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Visibility — metadata, PII-free, long-retained</div>
+              <div className="mt-1 text-sm">Per-endpoint over any window: <b>sent · delivered · failed · suppressed</b>, <b>success rate</b>, <b>p50/p99 latency</b>,
+                HTTP <b>status-code breakdown</b>, volume by type, breaker state; plus a filterable <b>delivery log</b> (notifId · type · status · latency · outcome · reason · <b>replayable?</b>).
+                The 7-day hot index is only a <b>speed cache</b> — older windows come from Athena/S3 at the type's <span style={mono}>retentionDays</span> (e.g. 365 d), so
+                <b> "what failed 50 days ago" is fully visible</b> (everything except the body).</div>
             </div>
             <div className="rounded-lg p-3" style={{ background: C.accentSoft, borderLeft: `4px solid ${C.accent}` }}>
-              <div className="text-xs font-bold uppercase" style={{ color: "#8A3A12" }}>Replay — three selection modes</div>
+              <div className="text-xs font-bold uppercase" style={{ color: "#8A3A12" }}>Replay — verbatim, three selection modes</div>
               <div className="mt-1 text-sm"><b>①</b> a single message <span style={mono}>{"{notifId}"}</span> · <b>②</b> a whole time-frame
                 <span style={mono}> {"{from,to}"}</span> · <b>③</b> a filtered time-frame <span style={mono}>{"{from,to, types:[X,Y], excludeTypes:[Z], status:failed}"}</span>
-                — e.g. only types X, Y (not Z) that failed.</div>
+                — e.g. only types X, Y (not Z) that failed. The <span style={mono}>Webhook λ</span> <b>loads the stored artifact and re-sends the bytes verbatim</b>;
+                only the transport envelope is refreshed (current bearer + HMAC over a fresh timestamp, so the consumer's replay-window check passes). Idempotent on <span style={mono}>notifId</span>.</div>
+            </div>
+          </div>
+          <div className="rounded-lg p-3" style={{ border: `1px solid ${C.line}` }}>
+            <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>PII &amp; retention — the artifact store, and the “50 days ago” answer</div>
+            <div className="mt-1 text-sm">
+              The artifact <i>is</i> the notification content, so it can hold PII → the <span style={mono}>WebhookDeliveryArtifact</span> store is <b>tenant-CMK-encrypted</b>,
+              IAM-isolated, honors erasure, and auto-purges at <span style={mono}>replayRetentionDays</span> (its own knob, default ~30 d) — <b>never in the PII-free audit lake</b>.
+              <b> Visibility and replayability decouple:</b> metadata follows <span style={mono}>retentionDays</span> (long), the artifact follows <span style={mono}>replayRetentionDays</span> (shorter).
+              A 50-day-old delivery is still <b>visible</b>; it is <b>replayable only if <span style={mono}>replayRetentionDays ≥ 50</span></b> — otherwise the row shows <span style={mono}>replayable:false</span> and a
+              replay is audited <span style={mono}>replay_skipped:expired</span>. Raising the window buys convenience at the cost of <b>keeping PII-bearing bodies longer</b> (bigger GDPR surface) — a
+              governance knob, not an accident. <b>Thin webhooks</b> carry no PII in the body and sidestep the tradeoff.
             </div>
           </div>
           <div className="text-sm">
-            <b>Kept simple by reuse:</b> <b>dry-run first</b> (returns count + sample, sends nothing) → confirm → replay tasks enqueue onto
-            <span style={mono}> webhook-q</span> in <b>paced waves</b> → the <span style={mono}>Webhook λ</span> <b>re-renders from the pinned templateVersion</b> and
-            <b> re-signs with current credentials</b>, through the same SSRF/retry/breaker/DLQ path. <b>Idempotent on <span style={mono}>notifId</span></b>, so double-replay is safe;
-            a payload past retention is un-replayable and audited <span style={mono}>replay_skipped:expired</span>. Every replay is audited (<span style={mono}>who · what · count</span>).
+            <b>Kept simple by reuse:</b> <b>dry-run first</b> (count + how many are still replayable vs expired, sends nothing) → confirm → replay tasks enqueue onto
+            <span style={mono}> webhook-q</span> in <b>paced waves</b> → load artifact → re-send verbatim through the same SSRF/retry/breaker/DLQ path.
+            Every replay is audited (<span style={mono}>replay_requested · webhook_replayed · replay_skipped:expired</span>).
           </div>
           <Code>{`GET  /v1/admin/webhooks/{id}/stats?from&to                  // rollups / calculations
 GET  /v1/admin/webhooks/{id}/deliveries?from&to&type&status // delivery log (filterable)
@@ -944,6 +960,7 @@ CRUD /v1/admin/tenants/{id}/sms-budget              // per-tenant SMS spend/rate
               ["InboxItem body", "Rendered text may contain PII; tenant CMK encrypted", "Same expiresAt; also on resolve"],
               ["Enrichment cache", "Masked placeholder form only — zero raw PII", "Per-type cache TTL"],
               ["Audit trail (S3)", "Recipients as HMAC token; no payload; no body text", "S3 lifecycle = retentionDays; Object Lock optional"],
+              ["WebhookDeliveryArtifact", "Exact sent bytes (may contain PII for fat webhooks); tenant CMK encrypted; thin webhooks are PII-free", "expiresAt = replayRetentionDays (separate, shorter knob) — then un-replayable"],
               ["Queues · logs · traces", "NEVER — CloudWatch data-protection policy enforces this", "N/A"],
               ["LLM prompt/response", "Allow-listed masked fields; output never stored; Bedrock no-retention", "Immediate — hash + token counts in audit only"],
             ]} />
