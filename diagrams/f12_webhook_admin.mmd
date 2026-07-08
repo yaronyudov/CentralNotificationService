@@ -2,37 +2,34 @@ sequenceDiagram
     autonumber
     participant AD as Tenant Admin<br/>(admin panel)
     participant API as Admin API<br/>(tenant-scoped JWT)
-    participant HOT as Hot audit index<br/>(DDB · last 7 days)
-    participant ATH as Athena<br/>(S3 Parquet · older)
-    participant PS as Payload store<br/>(pinned templateVersion)
+    participant HOT as Audit trail (PII-FREE)<br/>DDB hot index 7d + Athena/S3 (retentionDays)
+    participant ART as WebhookDeliveryArtifact<br/>exact sent bytes · CMK-enc · TTL replayRetentionDays
     participant WQ as webhook-q
     participant WH as Webhook λ
     participant EP as Tenant endpoint
 
-    Note over AD,ATH: ① VISIBILITY — a read view over audit data CNS already captures (no new store)
+    Note over AD,HOT: ① VISIBILITY — metadata only, PII-FREE, long-retained (50 days is fine)
     AD->>API: GET /v1/admin/webhooks/{id}/stats?from&to
-    API->>HOT: recent window (endpointId · last 7d)
-    API->>ATH: older window (partitions dt/type/tenant)
+    API->>HOT: 7d hot index = speed cache · older → Athena/S3 (retentionDays e.g. 365)
     API-->>AD: sent · delivered · failed · suppressed · success% ·<br/>p50/p99 latency · status-code breakdown · breaker state
     AD->>API: GET /v1/admin/webhooks/{id}/deliveries?from&to&type&status&cursor
-    API->>HOT: query + filter
-    API-->>AD: per-attempt rows: notifId · type · ts · httpStatus ·<br/>latency · attempt · outcome · reason (paged)
-    AD->>API: GET /v1/admin/webhooks/{id}/deliveries/{notifId}
-    API-->>AD: single delivery detail (all attempts + response)
+    API-->>AD: per-attempt rows: notifId · type · ts · httpStatus · latency ·<br/>outcome · reason · replayable? (NO body — audit is PII-free)
 
-    Note over AD,EP: ② REPLAY — one message · a whole time-frame · a filtered time-frame
-    Note over AD: selection modes —<br/>{notifId} | {from,to} | {from,to, types:[X,Y], excludeTypes:[Z], status:failed}
+    Note over AD,EP: ② REPLAY — re-send the EXACT bytes (no render · not from audit · not from DB payload)
+    Note over AD: selection —<br/>{notifId} | {from,to} | {from,to, types:[X,Y], excludeTypes:[Z], status:failed}
     AD->>API: POST /v1/admin/webhooks/{id}/replay {…selection…, dryRun:true}
-    API->>HOT: resolve selection → notifIds + count
-    API-->>AD: DRY-RUN: count + sample (nothing sent yet)
+    API->>HOT: resolve selection → notifIds (Athena works 50d back)
+    API-->>AD: DRY-RUN: count + how many still replayable vs expired (nothing sent)
     AD->>API: POST /v1/admin/webhooks/{id}/replay {…selection…, dryRun:false}
     API->>WQ: enqueue replay tasks (paced waves · replayId · idempotent notifId)
     WQ->>WH: receive
-    WH->>PS: fetch payloadRef → re-render with PINNED templateVersion (R10)
-    alt payload within retention
-        WH->>EP: POST re-signed with CURRENT creds ·<br/>Authorization: Bearer · X-CNS-Signature · X-CNS-Replay: true
+    WH->>ART: load stored artifact (the exact sent bytes)
+    alt artifact within replayRetentionDays
+        ART-->>WH: sent body (CMK-decrypted)
+        Note over WH: NO renderer runs · refresh transport ONLY —<br/>Bearer(current) + HMAC over fresh-ts.body + X-CNS-Replay:true
+        WH->>EP: POST verbatim body (content identical, auth/timestamp current)
         EP-->>WH: 2xx ⇒ audit webhook_replayed{delivered}
-        Note over WH,EP: non-2xx ⇒ same retry → webhook-DLQ path ·<br/>consumer is idempotent on notifId, so a duplicate is safe
-    else payload past retention / TTL
-        Note over WH: replay unavailable — audit replay_skipped:expired
+        Note over WH,EP: non-2xx ⇒ same retry → webhook-DLQ · consumer idempotent on notifId
+    else artifact aged out (older than replayRetentionDays)
+        Note over WH: still VISIBLE in the log, but replayable:false —<br/>audit replay_skipped:expired (raise replayRetentionDays to allow, at a PII-retention cost)
     end
