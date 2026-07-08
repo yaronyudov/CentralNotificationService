@@ -111,13 +111,16 @@ const Arch = () => (
       <Box x={326} y={62} w={128} h={58} l1="Intake λ" l2="idemp · RBAC · resolved-check" />
       <Box x={326} y={144} w={128} h={30} l1="payload + idemp (DDB)" tone="light" />
       <Box x={492} y={64} w={122} h={54} l1="SNS topic" l2="attrs: channels[] + stage" />
-      <Box x={660} y={26} w={62} h={26} l1="inbox-q" tone="queue" />
-      <Box x={660} y={70} w={62} h={26} l1="email-q" tone="queue" />
-      <Box x={660} y={114} w={62} h={26} l1="slack-q" tone="queue" />
-      <Box x={742} y={16} w={110} h={46} l1="Inbox λ" l2="render · DDB write" />
-      <Box x={866} y={16} w={88} h={46} l1="AppSync" l2="GraphQL + subs" />
-      <Box x={742} y={70} w={110} h={38} l1="Email λ" l2="render · outbox · SES" />
-      <Box x={742} y={116} w={110} h={38} l1="Slack λ" l2="render · token bucket" />
+      <Box x={660} y={22} w={62} h={24} l1="inbox-q" tone="queue" />
+      <Box x={660} y={62} w={62} h={24} l1="email-q" tone="queue" />
+      <Box x={660} y={102} w={62} h={24} l1="slack-q" tone="queue" />
+      <Box x={660} y={142} w={62} h={30} l1="+3 q" l2="wh·push·sms" tone="queue" />
+      <Box x={742} y={14} w={110} h={44} l1="Inbox λ" l2="render · DDB write" />
+      <Box x={866} y={14} w={88} h={44} l1="AppSync" l2="GraphQL + subs" />
+      <Box x={742} y={62} w={110} h={36} l1="Email λ" l2="render · outbox · SES" />
+      <Box x={742} y={102} w={110} h={36} l1="Slack λ" l2="render · token bucket" />
+      <Box x={742} y={142} w={110} h={30} l1="Webhook · Push · SMS λ" tone="accent" />
+      <Box x={866} y={142} w={88} h={30} l1="ext. providers" tone="light" />
       <Box x={492} y={196} w={86} h={34} l1="enrich-q" l2="messages WAIT" tone="queue" />
       <Box x={606} y={190} w={124} h={48} l1="Enricher λ" l2="cache · budget · guards" tone="accent" />
       <Box x={764} y={198} w={100} h={34} l1="Bedrock" l2="Haiku · temp 0" />
@@ -129,13 +132,16 @@ const Arch = () => (
       <Arrow d="M288 125 L322 102" mid="mA" />
       <Arrow d="M390 120 V140" mid="mA" dash />
       <Arrow d="M454 91 H488" mid="mA" />
-      <Arrow d="M614 78 L656 41" mid="mA" />
-      <Arrow d="M614 88 L656 84" mid="mA" label="filter: channels[]" lx={630} ly={62} />
-      <Arrow d="M614 98 L656 128" mid="mA" />
-      <Arrow d="M722 39 H738" mid="mA" />
-      <Arrow d="M722 83 H738" mid="mA" />
-      <Arrow d="M722 127 H738" mid="mA" />
-      <Arrow d="M852 39 H862" mid="mA" label="publish" lx={857} ly={30} />
+      <Arrow d="M614 84 L656 34" mid="mA" />
+      <Arrow d="M614 88 L656 74" mid="mA" label="filter: channels[]" lx={636} ly={64} />
+      <Arrow d="M614 96 L656 114" mid="mA" />
+      <Arrow d="M614 100 L656 157" mid="mA" />
+      <Arrow d="M722 34 H738" mid="mA" />
+      <Arrow d="M722 74 H738" mid="mA" />
+      <Arrow d="M722 114 H738" mid="mA" />
+      <Arrow d="M722 157 H738" mid="mA" />
+      <Arrow d="M852 36 H862" mid="mA" label="publish" lx={857} ly={28} />
+      <Arrow d="M852 157 H862" mid="mA" />
       <Arrow d="M535 118 V192" mid="mA" tone="accent" label="stage=enrich — WAITS" lx={535} ly={168} />
       <Arrow d="M578 213 H602" mid="mA" tone="accent" />
       <Arrow d="M730 215 H760" mid="mA" />
@@ -143,8 +149,9 @@ const Arch = () => (
     </svg>
     <div className="mt-1 text-xs" style={{ color: C.sub }}>
       Routing is configuration: <span style={mono}>NotificationType.channels[]</span> rides the message as SNS attributes and each queue subscribes with a
-      filter policy. AI types are published <span style={mono}>stage=enrich</span> — only the enrich queue matches, so <b>no channel can see the message
-      until the Enricher republishes it as <span style={mono}>stage=deliver</span></b>. High-res diagrams: diagrams/ (v14_components.png, f1–f6).
+      filter policy — six channels today (in-app, email, Slack, webhook, push, SMS; see the Channels tab). AI types are published
+      <span style={mono}> stage=enrich</span> — only the enrich queue matches, so <b>no channel can see the message
+      until the Enricher republishes it as <span style={mono}>stage=deliver</span></b>. High-res diagrams: diagrams/ (v14_components.png, f1–f11).
     </div>
   </div>
 );
@@ -295,6 +302,98 @@ const FLOWS = {
       { note: "wrong-send impossible by construction: unmappable ⇒ audited 'unclassified' — never a guess delivery" },
     ],
   },
+  f7: {
+    label: "7 · Webhook (A→Z)",
+    actors: ["Admin", "Endpoint reg", "Webhook λ", "SSRF guard", "Tenant HTTPS", "webhook-DLQ"],
+    steps: [
+      { note: "① register: POST /v1/admin/webhooks → signed verification challenge, must echo nonce ⇒ status active" },
+      { f: 0, t: 1, label: "register {url, subscribedTypes[]} · secret in Secrets Mgr" },
+      { f: 2, t: 4, label: "endpoint.verification (signed) → echo nonce ⇒ active", dashed: true },
+      { note: "② deliver — resolvable types re-check ResolutionGroup first (suppress if resolved)" },
+      { f: 2, t: 1, label: "list active endpoints where subscribedTypes ∋ typeId" },
+      { f: 2, t: 3, label: "resolve host → validate PUBLIC ip → pin ip (no redirects)" },
+      { note: "private / link-local / 169.254 metadata IP ⇒ BLOCKED, audited webhook_blocked:ssrf — never reaches the VPC" },
+      { f: 2, t: 4, label: "POST body + X-CNS-Signature: HMAC-SHA256(secret, ts.body) + notifId", tone: "accent" },
+      { f: 4, t: 2, label: "2xx ⇒ delivered (DeliveryRecord sending→delivered)", dashed: true },
+      { note: "non-2xx / timeout ⇒ full-jitter retry (honor Retry-After); breaker opens → endpoint auto-disabled + tenant alerted" },
+      { f: 2, t: 5, label: "maxReceiveCount → webhook-DLQ (ALARM)" },
+      { note: "consumer contract: verify signature · reject if |now−ts|>5m · 2xx fast · idempotent on notifId · at-least-once" },
+    ],
+  },
+  f8: {
+    label: "8 · Mobile / web push",
+    actors: ["App", "AppSync", "DeviceToken", "Push λ", "APNs / FCM", "push-DLQ"],
+    steps: [
+      { note: "① register on login + on every token refresh (tenant#user from JWT)" },
+      { f: 0, t: 1, label: "registerDevice {platform, token}" },
+      { f: 1, t: 2, label: "PutItem device (active=true)" },
+      { note: "② deliver — resolvable types delivery-time resolved-check first" },
+      { f: 3, t: 2, label: "get ALL active tokens for each recipient user" },
+      { f: 2, t: 3, label: "devices[] — phone · tablet · web", dashed: true },
+      { note: "render: badge = unread_ctr · collapseKey · ttl · contentPolicy=minimal ⇒ generic title (PII stays in the app)" },
+      { f: 3, t: 4, label: "send per device, in parallel — one notifId per device", tone: "accent" },
+      { f: 4, t: 3, label: "2xx ⇒ push_delivered{deviceCount}", dashed: true },
+      { note: "transient 5xx/429 ⇒ backoff → push-DLQ" },
+      { f: 4, t: 3, label: "410 Unregistered / BadDeviceToken", dashed: true },
+      { f: 3, t: 2, label: "mark token active=false (PRUNE) — NOT retried" },
+    ],
+  },
+  f9: {
+    label: "9 · SMS",
+    actors: ["sms-q", "SMS λ", "SmsConsent", "SMS budget", "Provider", "Phone"],
+    steps: [
+      { f: 0, t: 1, label: "receive (resolvable ⇒ delivery-time resolved-check first)" },
+      { f: 1, t: 2, label: "check consent (user / externalPhone)" },
+      { note: "opted_out ⇒ suppress + audit suppressed:opted_out — no send (legal)" },
+      { f: 1, t: 3, label: "atomic tenant SMS budget / rate check" },
+      { note: "over budget ⇒ degrade to no-SMS + admin alert (SMS is the most expensive channel)" },
+      { note: "render SHORT · encoding-aware GSM-7 160 / UCS-2 70 · ≤ maxSegments · per-country sender id · minimal content" },
+      { f: 1, t: 4, label: "send", tone: "accent" },
+      { f: 4, t: 1, label: "messageId → DLR: delivered | failed{reason}", dashed: true },
+      { note: "transient / throttle ⇒ backoff → sms-DLQ (ALARM)" },
+      { f: 5, t: 2, label: "user texts STOP ⇒ opted_out (suppression grows)" },
+      { note: "STOP / START / HELP handled by an inbound Lambda — opt-out always honored, out of band" },
+    ],
+  },
+  f10: {
+    label: "10 · Login → notification center (full flow)",
+    actors: ["User", "IdP (OIDC)", "AppSync", "DynamoDB", "Producer", "pipeline"],
+    steps: [
+      { note: "① LOGIN" },
+      { f: 0, t: 1, label: "authenticate (SSO)" },
+      { f: 1, t: 0, label: "JWT {tenantId, userId, roles}", dashed: true },
+      { note: "② OPEN THE NOTIFICATION CENTER — keys derived from JWT server-side" },
+      { f: 0, t: 2, label: "registerDevice {platform, token} (for push)" },
+      { f: 2, t: 3, label: "query inbox(cursor) + unreadCount — direct resolver, no Lambda" },
+      { f: 3, t: 0, label: "{items, unreadCount}", dashed: true },
+      { f: 0, t: 2, label: "subscription onInboxEvent(me) — pinned to JWT identity" },
+      { note: "③ A NOTIFICATION IS PRODUCED while the user is online" },
+      { f: 4, t: 5, label: "POST /v1/notifications → Intake → SNS → inbox-q" },
+      { f: 5, t: 3, label: "Inbox λ: TransactWrite item + unread_ctr +1" },
+      { f: 5, t: 2, label: "publishInboxEvent (IAM mutation)" },
+      { note: "④ THE USER SEES IT — live", tone: "accent" },
+      { f: 2, t: 0, label: "onInboxEvent UPSERT + BADGE — Bell updates, no refresh (p99 ≤ 1.5 s)", tone: "accent", dashed: true },
+    ],
+  },
+  f11: {
+    label: "11 · Fan-out resolved mid-flight — X is NEVER sent",
+    actors: ["Bus", "Intake λ", "ResolutionGroup", "Inbox λ", "Users A…M", "User X"],
+    steps: [
+      { note: "NOT the happy path: the fix lands BEFORE user X's wave is delivered" },
+      { f: 0, t: 1, label: "wallet.underfunded {eventTime=T1} — 8,000 recipients (> cap)" },
+      { f: 1, t: 2, label: "open episode 1 (resolvedAt = none)" },
+      { f: 1, t: 3, label: "publish, split into paced waves (wave 2 with X queued behind wave 1)" },
+      { f: 3, t: 4, label: "wave 1: resolved-check NOT resolved ⇒ deliver + UPSERT", tone: "accent" },
+      { note: "meanwhile the issue is FIXED" },
+      { f: 0, t: 1, label: "wallet.funds_added {occurredAt=T2, T2 > T1}" },
+      { f: 1, t: 2, label: "UpdateItem → resolved · resolvedAt=T2 · episode closed" },
+      { f: 1, t: 4, label: "sweep A…M → resolved · REMOVE (their copies disappear)", dashed: true },
+      { note: "NOW user X's wave finally runs" },
+      { f: 3, t: 2, label: "delivery-time resolved-check → resolved, resolvedAt=T2 ≥ T1" },
+      { f: 3, t: 5, label: "SUPPRESS — X's item NEVER written · no publish · no push/email", tone: "accent" },
+      { note: "audit: suppressed:already-resolved {user:X} — X never sees a wallet-underfunded notification" },
+    ],
+  },
 };
 
 /* ————— content data ————— */
@@ -324,8 +423,29 @@ const entities = [
   ["ResolutionGroup", "tenant#groupKey · episode · resolvedAt · sweepState — resolve-before-trigger writes a tombstone (TTL = type TTL)"],
   ["DeliveryRecord", "outbox per notifId·channel: sending→sent|failed|suppressed + providerMsgId"],
   ["IdempotencyKey", "tenant#eventId, TTL 48 h — duplicate producer calls are free"],
-  ["AuditEvent", "auditId = notifId#stage#attempt (idempotent) · stage · outcome · reason — no payload, recipient as HMAC token; new in v1.4: enrich_waiting · enrich_retry · enrich_dlq · redriven"],
+  ["AuditEvent", "auditId = notifId#stage#attempt (idempotent) · stage · outcome · reason — no payload, recipient as HMAC token; new: enrich_* · webhook_* · push_* · sms_* · suppressed:already-resolved"],
+  ["WebhookEndpoint (new)", "tenant#endpointId · url · secretRef (HMAC key) · subscribedTypes[] · status(pending|active|disabled) · breakerState · consecutiveFailures · mTLS — §3.6.1"],
+  ["DeviceToken (new)", "tenant#user · device#id · platform(ios|android|web) · token · appVersion · locale · active — pruned on provider 'unregistered' — §3.6.2"],
+  ["SmsConsent (new)", "tenant#user (or phone#hash) · status(opted_in|opted_out) · source · updatedAt — STOP/HELP driven suppression — §3.6.3"],
+  ["Recipient kinds", "user · role · externalEmail · slackChannel + externalPhone (SMS to a non-user number)"],
   ["Connection (v1.3)", "DELETED — AppSync owns connection state; there is nothing for CNS to store"],
+];
+
+const channelCatalog = [
+  ["in-app", "users", "InboxItem (DDB) → AppSync", "full", "~$0", "the Bell — real-time via subscription, correct via store"],
+  ["email", "users / external addr", "SES v2", "full", "$$ volume driver", "outbox + SES event stream (bounce/complaint)"],
+  ["Slack", "workspace channels / DMs", "Slack API", "full", "~$0 rate-limited", "per-workspace token bucket, Retry-After"],
+  ["webhook", "tenant HTTP endpoints", "tenant's HTTPS server", "full (own data)", "~$0", "HMAC-signed, SSRF-guarded, per-endpoint breaker (§3.6.1)"],
+  ["push", "users' devices", "APNs + FCM", "minimal for sensitive", "~$0", "multi-device fan-out, badge=unread, token pruning"],
+  ["SMS", "users' / external phone", "SNS/Pinpoint (Twilio pluggable)", "minimal always", "$$$ most expensive", "consent + STOP, segmentation, hard per-tenant budget"],
+];
+
+const webhookAtoZ = [
+  { t: "A · Register + verify", d: "Admin registers {url, subscribedTypes[]}; CNS POSTs a signed verification challenge the endpoint must echo before status flips pending→active. Proves ownership, catches typo'd URLs before any real event." },
+  { t: "B · Sign every request", d: "X-CNS-Signature: t=<ts>,v1=HMAC-SHA256(secret, ts.body). The consumer recomputes over raw bytes (constant-time) to authenticate CNS + verify integrity; the signed timestamp lets it reject replays (>5 min). Dual-sign window = zero-downtime secret rotation." },
+  { t: "C · SSRF / egress hardening (load-bearing)", d: "URL is tenant-controlled, so: HTTPS only · resolve DNS + validate every IP is PUBLIC (block RFC-1918, loopback, 169.254 metadata) · PIN the validated IP for the connection (defeats DNS-rebinding TOCTOU) · no redirects · dedicated egress subnet that can't reach the VPC. A payroll service must never be tricked into hitting an internal host." },
+  { t: "D · Reliability & backpressure", d: "Outbox DeliveryRecord before send; 2xx=success; non-2xx/timeout ⇒ full-jitter retry (honor Retry-After) → webhook-DLQ (alarm@1). Per-endpoint circuit breaker auto-disables a chronically-failing endpoint (+ tenant alert) — one bad endpoint never becomes an infinite bill. Per-endpoint bulkhead so one slow tenant can't starve the Lambda pool." },
+  { t: "E · Consumer contract", d: "Return 2xx fast (slow work async) · verify the signature · treat as at-least-once + idempotent on X-CNS-Notif-Id · tolerate out-of-order (use occurredAt)." },
 ];
 
 const gateFailures = [
@@ -374,6 +494,11 @@ const failures = [
   ["Tenant AI budget exhausted", "budget_denied — zero model calls, admin alert; that tenant's AI-type messages park until budget/config changes or an operator redrives"],
   ["Slack 429 storm", "Retry-After honored via delayed requeue; per-workspace bucket isolates tenants"],
   ["Email fails?", "SES event publishing: send/delivery/bounce/complaint/reject/delay per message → audit + CloudWatch; alarms; retry → DLQ (alarm@1). Fails loud, never silent (R4)"],
+  ["Webhook endpoint down / 5xx", "full-jitter retry (honor Retry-After) → webhook-DLQ; per-endpoint breaker opens → endpoint auto-disabled + tenant alerted after sustained failure"],
+  ["Webhook URL → private IP", "SSRF guard blocks at send (validate + pin public IP, no redirects, dedicated egress) → audited webhook_blocked:ssrf — never reaches the internal network"],
+  ["Push token invalid", "provider permanent error (Unregistered/BadDeviceToken) ⇒ NOT retried — token pruned; other devices of that user unaffected"],
+  ["SMS opted out / over budget", "opted_out ⇒ suppressed by law (STOP honored out-of-band); budget exhausted ⇒ degrade to no-SMS + admin alert (never a surprise bill)"],
+  ["Fan-out resolved mid-flight", "delivery-time resolved-check suppresses a not-yet-delivered recipient — the item is NEVER written / sent (flow 11), already-delivered copies get a REMOVE"],
   ["Trigger arrives after the fix", "Intake resolved-check: eventTime ≤ resolvedAt ⇒ suppressed as dup + audited; later ⇒ new episode delivered (A15)"],
   ["Implicit resolve misses", "layered backups: owning-service resolve API → role-recipient inbox resolve (A14) → type TTL as final backstop"],
   ["Implicit path rate control", "No API GW in front of EventBridge — rate control is consumer-side: Intake λ reserved concurrency + queue-depth alarms + idempotency key. A runaway bus emitter fills queues (paged) but cannot corrupt data"],
@@ -458,6 +583,7 @@ const SECTIONS = [
   { id: "verdict", label: "v1.4" },
   { id: "numbers", label: "Numbers" },
   { id: "arch", label: "Architecture" },
+  { id: "channels", label: "Channels" },
   { id: "flows", label: "Flows" },
   { id: "inbox", label: "Inbox rules" },
   { id: "api", label: "APIs" },
@@ -524,8 +650,9 @@ function App() {
           </div>
           <h1 className="mt-1 text-2xl font-extrabold leading-tight sm:text-3xl">Central Notification Service</h1>
           <p className="mt-1 text-sm" style={{ color: "#C9D8E6" }}>
-            One simple serverless pipeline — Intake λ → SNS attribute routing → one λ per channel — with AppSync as the entire in-app
-            surface and an AI gate that holds enriched notifications until the model has finished. Companion to docs/CNS-System-Design-v1.4.md.
+            One simple serverless pipeline — Intake λ → SNS attribute routing → one λ per channel (six now: in-app, email, Slack,
+            webhook, push, SMS) — with AppSync as the entire in-app surface and an AI gate that holds enriched notifications until the
+            model has finished. Companion to docs/CNS-System-Design-v1.4.md.
           </p>
           <Pipeline />
         </div>
@@ -564,6 +691,7 @@ function App() {
             ["Inbox REST + API GW WebSocket + connection registry", "one AppSync GraphQL API: queries + mutations + subscriptions; AWS manages connections"],
             ["Progressive enrichment (v1→v2, email hold, upgrade window)", "AI gate: stage=enrich → message WAITS → republish stage=deliver; ONE content version everywhere"],
             ["Two alternatives + iteration logs + scoring", "one solution; Kafka/EKS kept as a 1-page scale-up appendix with revisit triggers"],
+            ["3 channels (in-app · email · Slack)", "6 channels — added webhook, mobile push, SMS with ZERO pipeline change (Channels tab); + delivery-time resolved-check"],
           ]} />
           <div className="text-sm">
             <span className="font-bold" style={{ color: C.navy }}>Unchanged and still load-bearing: </span>
@@ -607,9 +735,55 @@ function App() {
           </div>
         </Section>
 
-        <Section id="flows" title="Sequence flows" kicker="5 flows · sources in diagrams/*.mmd (rendered PNGs alongside)">
+        <Section id="channels" title="Channels — six now, all the same shape" kicker="in-app · email · Slack · webhook · push · SMS">
+          <div className="text-sm">
+            Every channel is one <b>SQS queue + SNS filter policy + adapter λ + template column + DLQ</b>. Adding the three new ones
+            (<b>webhook, mobile push, SMS</b>) required <b>zero</b> changes to the Intake λ, the SNS topic, the AI gate, or the AppSync inbox —
+            that seam is exactly what ADR-1 exists to provide. Each adapter does: delivery-time resolved-check (resolvable types) → render → deliver → outbox record → audit → retry → DLQ.
+          </div>
+          <Table head={["Channel", "Targets", "Provider", "Content", "Cost", "Notes"]} rows={channelCatalog} tight />
+          <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Webhook — the full design (A → Z)</div>
+          <div className="text-sm" style={{ color: C.sub }}>
+            An <b>outbound</b> webhook to a tenant-registered HTTPS endpoint. Because the URL is tenant-controlled and CNS runs inside a payroll VPC,
+            this is as much a security design as a delivery one.
+          </div>
+          <div className="space-y-2">
+            {webhookAtoZ.map((o, i) => (
+              <div key={i} className="rounded-lg p-3" style={{ border: `1px solid ${o.t.includes("SSRF") ? C.accent : C.line}`, background: o.t.includes("SSRF") ? C.accentSoft : C.card }}>
+                <div className="text-sm font-extrabold" style={{ color: C.navy }}>{o.t}</div>
+                <div className="mt-1 text-sm">{o.d}</div>
+              </div>
+            ))}
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="rounded-lg p-3" style={{ background: C.wash }}>
+              <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Mobile / web push</div>
+              <div className="mt-1 text-sm">Device registry (<span style={mono}>DeviceToken</span> per user, registered on login + token refresh via
+                AppSync <span style={mono}>registerDevice</span>). Deliver to <b>all</b> a user's devices via APNs (HTTP/2) + FCM (HTTP v1); badge =
+                the unread counter. <b>Minimal content</b> for sensitive types (a lock-screen is public). Permanent provider errors
+                (<span style={mono}>Unregistered</span>) <b>prune</b> the token instead of retrying.</div>
+            </div>
+            <div className="rounded-lg p-3" style={{ background: C.wash }}>
+              <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>SMS</div>
+              <div className="mt-1 text-sm">Most expensive + most regulated → high-priority types only. <b>Consent</b> checked every send
+                (STOP/HELP flip <span style={mono}>SmsConsent</span> out-of-band); encoding-aware segmentation (GSM-7 160 / UCS-2 70);
+                per-country sender-ID / number pool; <b>hard per-tenant budget</b> so it can never surprise-bill; minimal content always;
+                phone numbers HMAC-tokenized in audit.</div>
+            </div>
+          </div>
+        </Section>
+
+        <Section id="flows" title="Sequence flows" kicker="11 flows including login→inbox (f10) & the resolve race (f11) · sources in diagrams/*.mmd">
           <Pick value={flow} set={setFlow} opts={Object.entries(FLOWS).map(([k, v]) => [k, v.label])} />
           <Seq actors={FLOWS[flow].actors} steps={FLOWS[flow].steps} />
+          {flow === "f11" && (
+            <Callout title="Why user X is never notified — the point of flow 11">
+              A large fan-out is split into paced waves. The fix event (<span style={mono}>wallet.funds_added</span>) resolves the group
+              <b> after</b> wave 1 delivered but <b>before</b> user X's wave 2 runs. Each adapter re-reads the <span style={mono}>ResolutionGroup</span> at
+              delivery time, sees <span style={mono}>resolvedAt ≥ eventTime</span>, and <b>suppresses X's copy entirely</b> — no item written, no push, no email.
+              X's inbox never shows a notification for an issue that was already fixed. Already-delivered recipients (A…M) get a <span style={mono}>REMOVE</span>.
+            </Callout>
+          )}
         </Section>
 
         <Section id="inbox" title="Inbox lifecycle rules" kicker="TTL · dismiss · resolution hierarchy · dedup guard">

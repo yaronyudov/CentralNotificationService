@@ -1,0 +1,40 @@
+sequenceDiagram
+    autonumber
+    participant U as User (browser / app)
+    participant IDP as Platform IdP<br/>(OIDC)
+    participant AS as AppSync GraphQL
+    participant DDB as DynamoDB<br/>(InboxItem · DeviceToken)
+    participant P as Producer service
+    participant IN as Intake λ
+    participant TOPIC as SNS topic
+    participant IQ as inbox-q
+    participant IW as Inbox λ
+
+    Note over U,IDP: ① LOGIN — establish identity
+    U->>IDP: authenticate (SSO)
+    IDP-->>U: JWT { tenantId, userId, roles }
+    Note over U: every CNS call now carries this JWT — keys are derived from it server-side
+
+    Note over U,DDB: ② OPEN THE NOTIFICATION CENTER
+    U->>AS: registerDevice {platform, token}  (for push)
+    AS->>DDB: PutItem DeviceToken (tenant#user)
+    U->>AS: query inbox(cursor) + unreadCount
+    AS->>DDB: Query PK=tenant#user (visibility filter) — direct JS resolver, no Lambda
+    DDB-->>AS: page of items + counter
+    AS-->>U: {items, unreadCount}
+    U->>AS: subscription onInboxEvent(me)
+    Note over AS: subscription auth pins userId = JWT identity —<br/>AppSync now holds the live connection (nothing for CNS to manage)
+
+    Note over P,IW: ③ A NOTIFICATION IS PRODUCED (while the user is online)
+    P->>IN: POST /v1/notifications {eventId, typeId, recipient=this user}
+    IN->>DDB: idempotency put · payload→payloadRef
+    IN->>TOPIC: publish · attrs channels=[inApp] · stage=deliver
+    IN-->>P: 202 accepted
+    TOPIC->>IQ: filter channels ∋ inApp
+    IQ->>IW: receive
+    IW->>DDB: TransactWrite item (state=unread) + unread_ctr +1
+    IW->>AS: publishInboxEvent (IAM mutation)
+
+    Note over U,AS: ④ THE USER SEES IT — live, no refresh
+    AS-->>U: onInboxEvent {kind: UPSERT, item} + {kind: BADGE, unread}
+    Note over U: Bell increments and the row appears — p99 ≤ 1.5 s from POST.<br/>Had the user been offline, the same item is read from the store on next inbox query (socket is only an optimization).

@@ -1,0 +1,51 @@
+sequenceDiagram
+    autonumber
+    participant ADM as Tenant Admin
+    participant API as Admin API
+    participant REG as WebhookEndpoint<br/>(DDB tenant#endpointId)
+    participant SEC as Secrets Manager<br/>(HMAC signing key)
+    participant SNS as SNS topic
+    participant WQ as webhook-q<br/>(filter: channels ∋ webhook)
+    participant WH as Webhook λ<br/>(reserved concurrency + per-endpoint bulkhead)
+    participant DNS as DNS + SSRF guard
+    participant EP as Tenant HTTPS endpoint
+    participant DLQ as webhook-DLQ<br/>(alarm at depth ≥ 1)
+
+    Note over ADM,SEC: ① REGISTER + VERIFY (once)
+    ADM->>API: POST /v1/admin/webhooks {url, subscribedTypes[]}
+    API->>SEC: create signing secret
+    API->>REG: PutItem status=pending
+    API->>EP: POST endpoint.verification {challengeId, nonce} (signed)
+    alt endpoint echoes nonce (2xx)
+        EP-->>API: 2xx {nonce}
+        API->>REG: status=active · verifiedAt
+        Note over API: audit: webhook_verified
+    else no / wrong ack
+        API->>REG: stays pending
+        Note over API: not activated — no events will be sent
+    end
+
+    Note over SNS,DLQ: ② DELIVER (per notification, resolvable types re-check first)
+    SNS->>WQ: stage=deliver · channels ∋ webhook
+    WQ->>WH: receive
+    WH->>REG: list active endpoints where subscribedTypes ∋ typeId
+    Note over WH: resolvable type? re-read ResolutionGroup —<br/>resolved & eventTime ≤ resolvedAt ⇒ suppress (audited)
+    WH->>SEC: get signing key (cached)
+    WH->>DNS: resolve host → validate PUBLIC ip · pin ip
+    alt resolves to private / link-local / metadata IP
+        DNS-->>WH: blocked
+        Note over WH: audit: webhook_blocked:ssrf — never leaves egress subnet
+    else public IP, pinned
+        DNS-->>WH: ok (connect to pinned IP, SNI=host, no redirects)
+        WH->>EP: POST body + X-CNS-Signature: t,v1=HMAC-SHA256(secret, ts.body)<br/>X-CNS-Notif-Id (idempotency) · X-CNS-Timestamp
+        alt 2xx
+            EP-->>WH: 2xx
+            Note over WH: DeliveryRecord sending→delivered · audit: webhook_delivered
+        else non-2xx / timeout
+            EP-->>WH: fail
+            Note over WH,WQ: full-jitter backoff retry (honor Retry-After)<br/>consecutiveFailures++ · breaker opens after threshold
+            WH->>REG: breakerState=open → status=disabled (sustained) + alert tenant
+            WQ->>DLQ: after maxReceiveCount → ALARM · audit: webhook_failed
+        end
+    end
+    Note over EP: consumer contract: verify signature · reject if |now−ts|>5m ·<br/>2xx fast · idempotent on notifId · tolerate at-least-once + out-of-order

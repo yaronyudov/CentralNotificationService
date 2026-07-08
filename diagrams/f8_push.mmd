@@ -1,0 +1,42 @@
+sequenceDiagram
+    autonumber
+    participant APP as Mobile / Web app
+    participant AS as AppSync
+    participant DT as DeviceToken<br/>(DDB tenant#user · device#id)
+    participant SNS as SNS topic
+    participant PQ as push-q<br/>(filter: channels ∋ push)
+    participant PU as Push λ
+    participant SEC as Secrets Manager<br/>(APNs .p8 · FCM service acct)
+    participant APNS as APNs (HTTP/2)
+    participant FCM as FCM (HTTP v1)
+    participant DLQ as push-DLQ
+
+    Note over APP,DT: ① REGISTER on login + on every token refresh
+    APP->>AS: registerDevice {platform, token, appVersion, locale}
+    Note over AS: tenant#user from JWT — never from body
+    AS->>DT: PutItem device row (active=true)
+    Note over APP,AS: on logout → unregisterDevice(deviceId)
+
+    Note over SNS,DLQ: ② DELIVER
+    SNS->>PQ: stage=deliver · channels ∋ push
+    PQ->>PU: receive
+    Note over PU: resolvable type? delivery-time resolved-check → suppress if resolved
+    PU->>DT: get ALL active tokens for each recipient user
+    DT-->>PU: devices[] (phone · tablet · web)
+    Note over PU: render push template · badge = unread_ctr · collapseKey · ttl<br/>type.contentPolicy=minimal ⇒ generic title only (PII stays in the app)
+    PU->>SEC: get provider credentials (cached)
+    Note over PU,FCM: send to every device in parallel — one notifId per device
+    PU->>APNS: notification (ios devices)
+    PU->>FCM: notification (android / web devices)
+    alt success (2xx)
+        APNS-->>PU: ok
+        FCM-->>PU: ok
+        Note over PU: audit: push_delivered{deviceCount}
+    else transient 5xx / 429
+        Note over PU,PQ: backoff retry → push-DLQ after maxReceive
+        PQ->>DLQ: ALARM
+    else permanent (Unregistered / BadDeviceToken / NOT_REGISTERED)
+        APNS-->>PU: 410 Unregistered
+        PU->>DT: mark token active=false (PRUNE) — do NOT retry
+        Note over PU: dead device cleaned up — other devices unaffected
+    end
