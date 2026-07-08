@@ -1,0 +1,38 @@
+sequenceDiagram
+    autonumber
+    participant BUS as Company Event Bus
+    participant IN as Intake λ
+    participant RG as ResolutionGroup<br/>(DDB tenant#groupKey)
+    participant SNS as SNS topic
+    participant IQ as inbox-q<br/>(paced waves)
+    participant IW as Inbox λ<br/>(delivery-time resolved-check)
+    participant DBA as Inbox of users A…M<br/>(wave 1)
+    participant AS as AppSync
+    participant DBX as Inbox of user X<br/>(wave 2)
+
+    Note over BUS,DBX: NOT the happy path — the fix lands BEFORE user X's wave is delivered
+    BUS->>IN: wallet.underfunded {eventTime=T1} — 8,000 recipients (> cap)
+    IN->>RG: open episode 1 (resolvedAt = none)
+    IN->>SNS: publish, split into paced waves (chunks ≤ 500)
+    SNS->>IQ: enqueue wave 1 (A…M) … wave 2 (…X…) queued behind it
+
+    Note over IQ,AS: wave 1 delivers first
+    IQ->>IW: wave 1 (users A…M)
+    IW->>RG: resolved-check → NOT resolved ⇒ deliver
+    IW->>DBA: write items (state=unread) + badge
+    IW->>AS: UPSERT × (A…M) — they see it
+
+    Note over BUS,RG: meanwhile the issue is FIXED
+    BUS->>IN: wallet.funds_added {occurredAt=T2, T2 > T1}
+    IN->>RG: UpdateItem → resolved · resolvedAt=T2 · episode closed
+    IN->>DBA: sweep GSI groupKey → state=resolved (already-delivered A…M)
+    IN->>AS: REMOVE × (A…M) + badge −1  (their copies disappear)
+
+    Note over IQ,DBX: NOW user X's wave finally runs
+    IQ->>IW: wave 2 (…user X…)
+    IW->>RG: delivery-time resolved-check
+    RG-->>IW: resolved=true · resolvedAt=T2 ≥ trigger eventTime T1
+    Note over IW,DBX: SUPPRESS — X's item is NEVER written · no AppSync publish · no push/email
+    IW-->>DBX: (nothing — the notification is never sent to user X)
+    Note over IW: audit: suppressed:already-resolved {user:X, episode:1}
+    Note over DBX: User X never sees a wallet-underfunded notification —<br/>the issue was already resolved by the time their wave would have delivered.

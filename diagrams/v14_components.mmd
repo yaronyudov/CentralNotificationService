@@ -16,15 +16,24 @@ flowchart LR
     IQ[[inbox-q]]
     MQ[[email-q]]
     SQ[[slack-q]]
+    WQ[[webhook-q]]
+    PQ[[push-q]]
+    MSQ[[sms-q]]
     IW["Inbox λ<br/>render + write"]
     EM["Email λ<br/>render + send"]
     SL["Slack λ<br/>render + post"]
+    WH["Webhook λ<br/>HMAC-sign · SSRF guard"]
+    PU["Push λ<br/>device lookup"]
+    SM["SMS λ<br/>consent · segment"]
 
-    DB[(DynamoDB<br/>InboxItem · groups ·<br/>config · budgets)]
-    AS[AppSync GraphQL<br/>queries · mutations ·<br/>subscriptions]
+    DB[(DynamoDB<br/>InboxItem · groups · config ·<br/>WebhookEndpoint · DeviceToken · SmsConsent)]
+    AS[AppSync GraphQL<br/>queries · mutations ·<br/>subscriptions · registerDevice]
     SES[SES]
     SLK[Slack API]
-    U[User<br/>Bell inbox]
+    EP[Tenant HTTPS endpoints]
+    APNS[APNs / FCM]
+    PROV[SMS provider<br/>SNS/Pinpoint · Twilio]
+    U[User<br/>Bell · devices · phone]
     AUD[(Audit<br/>Firehose→S3→Athena)]
     DLQ[[DLQs per queue<br/>alarm at depth ≥ 1]]
 
@@ -37,18 +46,30 @@ flowchart LR
     SNS -- inApp --> IQ --> IW
     SNS -- email --> MQ --> EM
     SNS -- slack --> SQ --> SL
+    SNS -- webhook --> WQ --> WH
+    SNS -- push --> PQ --> PU
+    SNS -- sms --> MSQ --> SM
     IW --> DB
     IW -- publish --> AS
     AS -- subscription + queries --> U
     AS -. direct JS resolvers .-> DB
     EM --> SES
     SL --> SLK
+    WH --> EP
+    PU --> APNS
+    SM --> PROV
     IN -.-> AUD
     EN -.-> AUD
     IW -.-> AUD
     EM -.-> AUD
     SL -.-> AUD
+    WH -.-> AUD
+    PU -.-> AUD
+    SM -.-> AUD
     EQ -.-> DLQ
     IQ -.-> DLQ
     MQ -.-> DLQ
     SQ -.-> DLQ
+    WQ -.-> DLQ
+    PQ -.-> DLQ
+    MSQ -.-> DLQ

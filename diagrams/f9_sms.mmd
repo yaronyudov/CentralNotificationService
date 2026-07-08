@@ -1,0 +1,45 @@
+sequenceDiagram
+    autonumber
+    participant SNS as SNS topic
+    participant SQ as sms-q<br/>(filter: channels ∋ sms)
+    participant SM as SMS λ
+    participant CON as SmsConsent<br/>(DDB · opt-in/out)
+    participant BUD as Tenant SMS budget<br/>(atomic counter)
+    participant PROV as SMS provider<br/>(SNS/Pinpoint · Twilio pluggable)
+    participant USR as Recipient phone
+    participant IN as Inbound λ<br/>(STOP / HELP / START)
+    participant DLQ as sms-DLQ
+
+    SNS->>SQ: stage=deliver · channels ∋ sms
+    SQ->>SM: receive
+    Note over SM: resolvable type? delivery-time resolved-check → suppress if resolved
+    SM->>CON: check consent (user / externalPhone)
+    alt opted_out
+        CON-->>SM: opted_out
+        Note over SM: suppress + audit suppressed:opted_out — no send (legal)
+    else opted_in
+        CON-->>SM: ok
+        SM->>BUD: atomic check tenant SMS budget/rate
+        alt over budget
+            BUD-->>SM: denied
+            Note over SM: degrade to no-SMS + admin alert (no surprise bill)
+        else ok
+            BUD-->>SM: ok
+            Note over SM: render SHORT template · encoding-aware (GSM-7 160 / UCS-2 70)<br/>segment ≤ maxSegments · country → sender-ID / number pool · minimal content
+            SM->>PROV: send (per-country sender id)
+            alt accepted
+                PROV-->>SM: messageId
+                Note over SM: audit: sms_sent
+                PROV-->>SM: DLR: delivered | failed{reason}
+                Note over SM: audit: sms_delivered | sms_failed
+            else transient failure / throttle
+                Note over SM,SQ: backoff retry → sms-DLQ after maxReceive
+                SQ->>DLQ: ALARM
+            end
+        end
+    end
+
+    Note over USR,CON: opt-out is always honored, out of band
+    USR->>IN: texts STOP
+    IN->>CON: status=opted_out (suppression list grows)
+    Note over IN: START re-subscribes · HELP returns info — audited

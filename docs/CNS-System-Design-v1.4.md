@@ -34,10 +34,15 @@ Producers (API GW HTTP | EventBridge rules)
    → SNS topic  message attributes: channels[] (from NotificationType config) + stage
         stage=enrich   → enrich-q (SQS) ⟵ AI messages WAIT here — no channel sees them
                           → Enricher λ → republish stage=deliver (+ enriched fields)
-        stage=deliver  ├→ inbox-q → Inbox λ  (render + DynamoDB write + AppSync publish)
-                       ├→ email-q → Email λ  (render + SES)
-                       └→ slack-q → Slack λ  (render + Slack API)
+        stage=deliver  ├→ inbox-q   → Inbox λ    (render + DynamoDB write + AppSync publish)
+                       ├→ email-q   → Email λ    (render + SES)
+                       ├→ slack-q   → Slack λ    (render + Slack API)
+                       ├→ webhook-q → Webhook λ  (render + HMAC-sign + POST to tenant endpoint)
+                       ├→ push-q    → Push λ     (device lookup + APNs / FCM)
+                       └→ sms-q     → SMS λ      (consent check + segment + SMS provider)
 ```
+
+Six channels ship in v1.4: **in-app, email, Slack** (original) and **webhook, mobile push, SMS** (§3.6). Every one is the same shape — an SQS queue with an SNS filter policy, an adapter Lambda, its own retry policy and DLQ, and a template column — so the pipeline itself never changed to add three channels. That is the extensibility seam ADR-1 exists to provide.
 
 **NFR anchors.** Sustained 10,000 notifications/min (~167/s), bursts to 50,000/min (~833/s); no silent drops (DLQ per queue, depth-0 steady state, alarms otherwise); hard tenant isolation; producer `eventId` idempotency; PII never in logs.
 
@@ -53,6 +58,8 @@ Producers (API GW HTTP | EventBridge rules)
 ## 3. Component walkthrough
 
 ![Component overview](../diagrams/v14_components.png)
+
+**Sequence diagrams** (sources in [`../diagrams/`](../diagrams/)): `f1_explicit` (explicit single-user), `f2_fanout` (bus fan-out + implicit resolve), `f3_enrichment` (the AI gate), `f4_inbox` (AppSync read/resolve), `f5_triage` (AI event triage), `f6_counter` (unread-counter ladder), `f7_webhook`, `f8_push`, `f9_sms` (the three new channels, §3.6), `f10_login_to_inbox` (full flow: login → JWT → subscribe → device register → notification → Bell, §7), and `f11_resolve_race` (fan-out resolved mid-flight — a recipient is **never** notified, §7).
 
 ### 3.1 Intake λ — the only place events enter
 
@@ -79,8 +86,11 @@ Subscriptions are SQS queues with **filter policies**:
 | `inbox-q` | `stage = deliver AND channels contains inApp` |
 | `email-q` | `stage = deliver AND channels contains email` |
 | `slack-q` | `stage = deliver AND channels contains slack` |
+| `webhook-q` | `stage = deliver AND channels contains webhook` |
+| `push-q` | `stage = deliver AND channels contains push` |
+| `sms-q` | `stage = deliver AND channels contains sms` |
 
-Consequences: adding a channel is a new queue + λ + filter policy — zero pipeline change; a Slack outage cannot touch email or in-app latency (per-queue isolation, retry policy, and DLQ); and **AI-type messages are structurally invisible to channel queues** until the Enricher republishes them with `stage=deliver` — the "wait" is enforced by topology, not by discipline.
+Consequences: adding a channel is a new queue + λ + filter policy — zero pipeline change (the webhook, push, and SMS rows above were literally added without touching intake, SNS, or any other adapter); a Slack outage cannot touch email or in-app latency (per-queue isolation, retry policy, and DLQ); and **AI-type messages are structurally invisible to channel queues** until the Enricher republishes them with `stage=deliver` — the "wait" is enforced by topology, not by discipline.
 
 ### 3.3 Channel λs — render + deliver, one per channel
 
@@ -91,6 +101,8 @@ Each channel λ renders its own template (shared library; Mustache-strict — an
 - **Slack λ:** per-tenant bot token (Secrets Manager), token bucket per workspace/channel (~1 msg/s guidance), HTTP 429 honored via `Retry-After` delayed requeue.
 
 Every consumer conditions on the deterministic `notifId = hash(eventId, recipient, channel)` — redrives and at-least-once delivery are safe everywhere.
+
+**Delivery-time resolved-check (new in v1.4).** The Intake λ runs the resolved-check once, at ingest. But a large fan-out is split into paced waves, and a group can be resolved *after* the waves are enqueued and *before* a later wave is delivered. So for **resolvable types every channel adapter re-reads the `ResolutionGroup` immediately before its side-effect**: if the group is resolved and the trigger's `eventTime ≤ resolvedAt`, the adapter **suppresses the delivery entirely** — no inbox item is written, no email/Slack/webhook/push/SMS is sent — and audits `suppressed:already-resolved`. This is the mechanism behind the fan-out-race guarantee (§7, diagram `f11_resolve_race`): a recipient whose wave has not yet been delivered when the issue is resolved is **never notified at all**, not written-then-removed. The check is one point-read of `tenant#groupKey` (cached in-adapter for the batch), so it costs microseconds and cannot itself stall delivery.
 
 ### 3.4 The in-app surface — one AppSync GraphQL API
 
@@ -128,7 +140,134 @@ enum InboxEventKind { UPSERT REMOVE BADGE }   # REMOVE reason: resolved | expire
 
 - **Config store:** `NotificationType`, templates (versioned, draft→shadow→active), bus mappings (notify/resolve, shadow-mode first), org overrides, `TenantAiBudget`. Admin API is internal OIDC, every write versioned + cache-busting, exactly as v1.3 §9.4.
 - **Audit:** dual-plane, unchanged from v1.3 §11 — authoritative state written with the side-effect it describes; analytical trail (idempotent `auditId = notifId#stage#attempt`) via Firehose → S3 Parquet + Athena, 7-day hot index; daily reconciliation with drift alarm; PII never in the trail. New v1.4 audit events for the AI gate: `enrich_waiting`, `enrich_retry{reason,attempt}`, `enrich_dlq{reason}`, `redriven`.
-- **Observability:** golden dashboard — ingest rate, per-queue oldest-message-age, per-channel success and delivery p99, **all DLQ depths (steady state 0)**, enrichment retry/DLQ rate and budget burn, AppSync connection/publish errors, SES bounce/complaint, top-10 tenants by volume.
+- **Observability:** golden dashboard — ingest rate, per-queue oldest-message-age, per-channel success and delivery p99, **all DLQ depths (steady state 0)**, enrichment retry/DLQ rate and budget burn, AppSync connection/publish errors, SES bounce/complaint, per-endpoint webhook health, push token-invalidation rate, SMS opt-out and spend, top-10 tenants by volume.
+
+### 3.6 Channel catalog — email, Slack, in-app, and the three new adapters
+
+Every adapter obeys the same contract: consume its queue → (for resolvable types) delivery-time resolved-check → render the channel template → deliver → write a `DeliveryRecord` outbox row → emit audit → on transient failure retry with full-jitter backoff → on exhaustion move to that channel's DLQ (alarm at depth 1). The three new channels differ only in *what "deliver" means* and *what state they need to look up first*.
+
+| Channel | Targets | Needs a registry? | Provider | Content policy | Cost profile |
+|---|---|---|---|---|---|
+| in-app | users | InboxItem (DDB) | AppSync/DDB | full | ~$0 |
+| email | users / external addr | — | SES v2 | full | $$ (volume driver) |
+| Slack | workspace channels / user DMs | bot tokens (Secrets Mgr) | Slack API | full | ~$0 (rate-limited) |
+| **webhook** | tenant HTTP endpoints | `WebhookEndpoint` | tenant's own HTTPS server | full (tenant's own data) | ~$0 |
+| **push** | users' mobile/web devices | `DeviceToken` | APNs (HTTP/2) + FCM (HTTP v1) | **minimal for sensitive types** | ~$0 |
+| **SMS** | users' / external phone numbers | `SmsConsent` + phone | SNS/Pinpoint SMS (Twilio pluggable) | **minimal always** | $$$ (most expensive) |
+
+---
+
+#### 3.6.1 Webhook channel — the full design (A → Z)
+
+An **outbound** webhook: CNS delivers a notification to an HTTPS endpoint the tenant registers, so the tenant's own systems receive events programmatically. Because the destination URL is tenant-controlled and CNS runs inside a payroll/payments VPC, this channel is as much a **security** design as a delivery one.
+
+**A. The entity.**
+
+```jsonc
+// WebhookEndpoint — one per registered tenant endpoint
+{
+  "PK": "tenant#org_912", "SK": "endpoint#ep_7f3",
+  "url": "https://hooks.acme.example/cns",          // HTTPS only
+  "secretRef": "secretsmanager://cns/webhook/ep_7f3", // HMAC signing key (32B+), rotatable
+  "subscribedTypes": ["wallet.underfunded", "payroll.approval.required"], // or ["*"]
+  "status": "active",            // pending → active → disabled (auto or manual)
+  "customHeaders": {"X-Acme-Env": "prod"},           // static, non-secret only
+  "failureCount": 0, "consecutiveFailures": 0, "breakerState": "closed",
+  "verifiedAt": "2026-07-08T…", "createdBy": "admin@org_912", "mTLS": false
+}
+```
+
+**B. Registration + verification handshake.** An admin registers the endpoint via the admin API (§6). CNS immediately POSTs a signed `endpoint.verification` challenge (`{challengeId, nonce}`); the endpoint must echo the nonce (or return `2xx` with the expected body) within a short window. Only then does `status` flip `pending → active`. This proves ownership, catches typo'd URLs before any real event, and is auditable (`webhook_verified`). Re-verification can be forced after a URL change.
+
+**C. Routing.** Webhook is a **config-driven** channel, not a per-user recipient: when a `NotificationType` lists `webhook` in `channels` (or an org override enables it), the SNS message carries `channels ∋ webhook`. The `Webhook λ` expands the delivery to **every active `WebhookEndpoint` in that tenant whose `subscribedTypes` matches the `typeId`** — so one event fans out to the tenant's N endpoints, each an independent `notifId = hash(eventId, endpointId, "webhook")`.
+
+**D. The request CNS sends.**
+
+```http
+POST /cns HTTP/1.1
+Host: hooks.acme.example
+Content-Type: application/json
+User-Agent: CNS-Webhook/1.0
+X-CNS-Event-Id: pay-run-8812-approval          # producer eventId
+X-CNS-Notif-Id: 3f9c…                           # deterministic; the idempotency key
+X-CNS-Delivery-Id: d_01H…                        # unique per attempt
+X-CNS-Type: payroll.approval.required
+X-CNS-Timestamp: 1751971200                      # unix seconds, signed
+X-CNS-Signature: t=1751971200,v1=<hex hmac-sha256>
+Idempotency-Key: 3f9c…                           # == notifId
+
+{ "type":"payroll.approval.required", "tenantId":"org_912",
+  "occurredAt":"2026-07-08T09:00:00Z", "entityRef":"payrun#8812",
+  "data": { … allow-listed / rendered fields … } }
+```
+
+- **Signature.** `v1 = HMAC-SHA256(secret, "{timestamp}.{raw-body}")`, hex. The consumer recomputes it over the *raw* bytes and compares in constant time — this authenticates CNS and guarantees body integrity. The signed timestamp lets the consumer **reject replays** (drop if `|now − timestamp| > 5 min`). Two signatures can be sent during secret rotation (`v1=…,v1=…`) so rotation is zero-downtime.
+- **Thin vs fat.** Default **fat** (the rendered `data` inline) because the destination is the tenant's *own* system receiving its *own* tenant's data over TLS. A per-endpoint `thin: true` option sends only `{type, notifId, entityRef}` and the consumer pulls the detail from `GET /v1/notifications/{id}/status` — for tenants who prefer to authenticate a pull rather than trust a push.
+
+**E. SSRF / egress hardening — the load-bearing security control.** The URL is attacker-influenceable (a compromised tenant admin), so the `Webhook λ`:
+1. accepts **HTTPS only**, valid public hostname; rejects userinfo/ports outside {443, allow-listed}.
+2. **resolves DNS itself, validates every resolved IP is public** (blocks RFC-1918, loopback, link-local `169.254.0.0/16` incl. the `169.254.169.254` metadata endpoint, IPv6 ULA/mapped equivalents), and **pins the validated IP for the actual connection** (connect to the pinned IP with SNI = host) to defeat DNS-rebinding (TOCTOU) between check and connect.
+3. **does not follow redirects** (a 3xx is a delivery failure, not a hop to a new, unvalidated host).
+4. runs in a **dedicated egress path** — a subnet whose NAT/proxy can only reach the public internet, never the internal VPC — so even a bypassed app check cannot reach an internal service. Optional per-tenant domain allow-list.
+5. caps request/response body size and enforces connect+read timeouts.
+
+**F. Reliability & backpressure.**
+- Outbox `DeliveryRecord{notifId, endpointId, state: sending→delivered|failed, httpStatus, attempt}` written `sending` before the POST — a crash mid-send is disambiguated on redrive by `notifId`.
+- Success = `2xx`. Non-2xx / timeout / connection error ⇒ retry via SQS visibility backoff (full jitter), honoring `Retry-After`. `maxReceiveCount` → **`webhook-DLQ` (alarm at depth 1)**.
+- **Per-endpoint circuit breaker.** Consecutive failures past a threshold open the breaker: deliveries for that endpoint short-circuit to a park state, the tenant admin is alerted, and after sustained failure the endpoint is **auto-disabled** (`status → disabled`) exactly as Stripe/GitHub do — one broken endpoint never becomes an infinite retry bill. A half-open probe (or manual re-enable) restores it.
+- **Bulkhead.** A per-endpoint concurrency cap / token bucket means one slow tenant endpoint cannot consume the whole `Webhook λ` reserved-concurrency pool and starve other tenants (noisy-neighbor isolation).
+
+**G. Consumer contract (documented for tenants).** Return `2xx` within a few seconds and do slow work async; **verify the signature** before trusting the body; treat delivery as **at-least-once** and **idempotent on `X-CNS-Notif-Id`**; tolerate out-of-order arrival (use `occurredAt`); expect redelivery after any non-2xx.
+
+**H. Observability & audit.** Per-attempt audit `webhook_attempt{endpointId, httpStatus, latency, attempt}`, `webhook_delivered | webhook_failed | webhook_disabled`; the golden dashboard shows per-endpoint success rate, p99 latency, breaker state, and DLQ depth. Endpoint URLs are config (not PII); no payload is stored in audit (hash + status only).
+
+---
+
+#### 3.6.2 Mobile & web push
+
+Delivers to a user's registered devices via **APNs** (Apple, HTTP/2 + token/`.p8` auth) and **FCM** (Google/Android/web, HTTP v1 + OAuth). (Amazon SNS Mobile Push or Pinpoint are drop-in alternatives that wrap the same providers; the adapter contract is identical.)
+
+**A. Device registry.**
+
+```jsonc
+// DeviceToken — many per user (phone, tablet, web)
+{ "PK":"tenant#org_912#user#u_army", "SK":"device#dev_a1",
+  "platform":"ios",           // ios | android | web
+  "token":"<APNs/FCM token>", "appVersion":"4.2.0", "locale":"en",
+  "active":true, "lastSeenAt":"2026-07-08T…" }
+```
+
+The app **registers the token on login and on every token refresh** through the AppSync mutation `registerDevice` (or `unregisterDevice` on logout). This is one of the pieces the full login-to-inbox flow shows (§7, `f10`).
+
+**B. Delivery.** `push-q` (filter `channels ∋ push`) → `Push λ`: resolve recipient users → look up **all active device tokens** (`tenant#user → devices[]`) → render the push template (`title`, `body`, deep-link, `badge = unread_ctr`, `collapseKey`, `priority`, `ttl`) → send to APNs/FCM per device, in parallel, one `notifId` per device. A user with 3 devices = 3 sends, one logical notification.
+
+**C. PII discipline — minimal content for sensitive types.** Push payloads traverse Apple/Google and appear on a lock screen, so each type declares `push.contentPolicy`: `minimal` types send only a generic title (*"New payroll approval required"*) and the app fetches the detail from the inbox after unlock; `full` types may include rendered body. Payroll/salary types default to `minimal`. No secrets, ever, in a push.
+
+**D. Reliability & token hygiene.** Retry transient `5xx`/`429` with backoff (honor APNs/FCM throttling) → `push-DLQ`. **Permanent** provider errors (`Unregistered`, `BadDeviceToken`, FCM `NOT_REGISTERED`) are *not* retried — they trigger a **feedback loop that marks the token `active:false` and prunes it**, so a dead device is cleaned up rather than retried forever. Badge counts ride the same unread counter as in-app, so push and Bell never disagree.
+
+**E. Credentials.** APNs `.p8` key + FCM service-account JSON live in Secrets Manager (platform-owned app, so platform-level not per-tenant), cached and rotated.
+
+---
+
+#### 3.6.3 SMS
+
+The most expensive and most regulated channel — reserved for high-priority types (payroll failures, security codes). Provider: **Amazon SNS / Pinpoint SMS** by default (Twilio pluggable behind the same adapter interface); Papaya's 160+ countries make **global sender-ID / number-pool** handling and per-country compliance first-class.
+
+**A. Recipient & consent.** Targets a user's phone (from profile) or an `externalPhone` recipient. Before every send the `SMS λ` checks **`SmsConsent`** (`opted_in | opted_out`, per user/number): opted-out numbers are suppressed and audited `suppressed:opted_out`. Inbound **STOP / HELP / START** keywords (handled by a small inbound Lambda on the provider's two-way number) flip consent and auto-grow the suppression list — legal opt-out is honored automatically.
+
+**B. Render, encode, segment.** SMS templates are short; the adapter is **encoding-aware** — GSM-7 (160 chars/segment) vs UCS-2 (70 chars/segment for non-Latin scripts) — computes segment count, and enforces a per-type `maxSegments` cap (truncate-with-link rather than send a 6-part message). Sensitive content is **always minimal**: a code or *"Payroll run 8812 failed — open the app"*, never salary figures.
+
+**C. Country / number strategy.** A number-pool/sender-ID map per destination country (short code, long code, toll-free, or alphanumeric sender ID where allowed), plus quiet-hours suppression per locale and DND-registry awareness — all config, resolved per recipient country.
+
+**D. Reliability & cost control.** Delivery receipts (DLR) from the provider stream into audit (`sms_sent → sms_delivered | sms_failed{reason}`); transient failures retry with backoff → `sms-DLQ`. Because each message costs real money, SMS has a **hard per-tenant budget + rate limit** (same config-store pattern as `TenantAiBudget`): exhaustion degrades to *no SMS* + admin alert (never a surprise five-figure bill). Phone numbers are HMAC-tokenized in audit.
+
+---
+
+#### 3.6.4 What the three channels added to the rest of the system
+
+- **Data model:** `WebhookEndpoint`, `DeviceToken`, `SmsConsent` entities; recipient kinds gain `externalPhone`; `NotificationType.channels` enum gains `webhook | push | sms` with per-channel settings (§5).
+- **Public surfaces:** admin CRUD for webhook endpoints (+ verify/rotate), AppSync `registerDevice`/`unregisterDevice` mutations, SMS consent + budget config (§6).
+- **Everything else is unchanged:** same idempotency, same audit contract (new per-channel events), same DLQ+alarm discipline, same delivery-time resolved-check. Adding these channels required **zero** changes to the Intake λ, the SNS topic, the AI gate, or the AppSync inbox surface — which is the whole point.
 
 ---
 
@@ -206,10 +345,15 @@ Unchanged from v1.3 §10.6 (T1 design-time author + T2 signature-gated runtime r
 | `NotificationType`, `Template`, `BusMapping`, `OrgOverride`, `TenantAiBudget`, `BudgetUsage` | unchanged (minus `upgradeWindowMs`, plus `maxAttempts`/`retryBackoff` in `aiEnrichment`) |
 | Envelope / DeliveryTask (transit) | unchanged, but ride **SNS→SQS** instead of route-q/channel queues; carry `stage` attribute |
 | `InboxItem` | unchanged keys (`PK tenant#user`, `SK createdAt#notifId`, GSI on `groupKey`, `expiresAt` TTL) — **`contentVersion`/`enrichedAt` removed**: one version only |
-| `ResolutionGroup`, `DeliveryRecord` (outbox), `IdempotencyKey`, `AuditEvent` | unchanged |
+| `ResolutionGroup`, `DeliveryRecord` (outbox), `IdempotencyKey`, `AuditEvent` | unchanged (`DeliveryRecord.channel` enum + `httpStatus`/`attempt` now also cover webhook/push/sms) |
 | `Connection` (WebSocket registry) | **deleted — AppSync manages connections** |
+| **`WebhookEndpoint`** (new) | `PK tenant#endpointId` · `url`, `secretRef`, `subscribedTypes[]`, `status(pending\|active\|disabled)`, `breakerState`, `consecutiveFailures`, `customHeaders`, `mTLS`, `verifiedAt` — §3.6.1 |
+| **`DeviceToken`** (new) | `PK tenant#user`, `SK device#id` · `platform(ios\|android\|web)`, `token`, `appVersion`, `locale`, `active`, `lastSeenAt` — pruned on provider "unregistered" — §3.6.2 |
+| **`SmsConsent`** (new) | `PK tenant#user` (or `phone#hash`) · `status(opted_in\|opted_out)`, `source`, `updatedAt` — STOP/HELP driven suppression — §3.6.3 |
+| `NotificationType.channels` enum | gains **`webhook`, `push`, `sms`** with per-channel settings (`push.contentPolicy`, `push.collapseKey`, `push.ttl`, `sms.contentPolicy`, `sms.maxSegments`, `sms.senderIdPolicy`, webhook via tenant endpoint registry) |
+| Recipient kinds | `user`, `role`, `externalEmail`, `slackChannel` **+ `externalPhone`** (SMS to a non-user number) |
 
-PII posture unchanged (v1.3 §8.1): payload-by-reference everywhere, tenant-tier CMKs, masked-placeholder-only enrichment cache, HMAC-tokenized recipients in audit, logger schema that cannot carry payloads.
+PII posture unchanged (v1.3 §8.1): payload-by-reference everywhere, tenant-tier CMKs, masked-placeholder-only enrichment cache, HMAC-tokenized recipients (and phone numbers) in audit, logger schema that cannot carry payloads. Push and SMS additionally apply a **minimal-content policy** for sensitive types so PII never rides a lock screen or a carrier network.
 
 ---
 
@@ -229,9 +373,31 @@ GET  /v1/notifications/{id}/status per-recipient/channel delivery states
 
 Schema in §3.4. Client contract: query `inbox`/`unreadCount` on open, subscribe `onInboxEvent(me)` for live `UPSERT | REMOVE | BADGE` events, call `markRead`/`dismiss`/`resolve` mutations. Lifecycle semantics (TTL never visible, `dismissOnRead`, group resolve sweep, unread counter with conditional decrements + L1 read-time self-heal + weekly L2 sweep) are exactly v1.3 §5.4 — only the transport changed.
 
-### 6.3 Admin API — unchanged
+### 6.3 Device & consent registration (new — for push and SMS)
 
-CRUD types/templates/mappings/org-overrides/ai-budgets, template promote (draft→shadow→active), one-click DLQ redrive, 7-day delivery lookup.
+```graphql
+type Mutation {
+  registerDevice(input: DeviceInput!): Device!     # on login + on token refresh
+  unregisterDevice(deviceId: ID!): Boolean!        # on logout
+  setSmsConsent(status: SmsConsentStatus!): SmsConsent!   # in-app opt-in/out
+}
+# DeviceInput { platform, token, appVersion, locale }
+# tenant#user is taken from the JWT — never from the client body
+```
+
+Inbound SMS keywords (`STOP` / `START` / `HELP`) are handled provider-side by a small inbound Lambda that flips `SmsConsent` and updates the suppression list — legal opt-out without any app interaction.
+
+### 6.4 Admin API (extended for webhook + SMS)
+
+Unchanged: CRUD types/templates/mappings/org-overrides/ai-budgets, template promote (draft→shadow→active), one-click DLQ redrive (now also `webhook-DLQ`/`push-DLQ`/`sms-DLQ`), 7-day delivery lookup. **New:**
+
+```
+CRUD /v1/admin/webhooks                     register / update / disable tenant endpoints
+POST /v1/admin/webhooks/{id}/verify         (re)send the signed verification challenge
+POST /v1/admin/webhooks/{id}/rotate-secret  dual-sign window for zero-downtime rotation
+POST /v1/admin/webhooks/{id}/enable         clear the breaker after a fix
+CRUD /v1/admin/tenants/{id}/sms-budget      per-tenant SMS spend/rate cap (TenantAiBudget pattern)
+```
 
 ---
 
@@ -246,10 +412,16 @@ CRUD types/templates/mappings/org-overrides/ai-budgets, template promote (draft�
 | SES bounce spike | bounce > 2 % alarm | nothing | suppression list auto-grows; per-type auto-pause |
 | DDB hot partition | throttle metric | slightly delayed inbox writes | key design spreads load; jittered batch backoff |
 | AppSync publish failure | publish-error metric | badge staleness only | client refetches on connect/open — store is the source of truth |
+| Webhook endpoint down / 5xx | per-endpoint failure rate; breaker trips | tenant's integration lags | full-jitter retry (honor `Retry-After`) → `webhook-DLQ`; breaker opens, endpoint auto-disabled + tenant alerted after sustained failure |
+| Webhook URL resolves to a private IP | SSRF guard rejects at send | nothing sent | delivery blocked + audited `webhook_blocked:ssrf`; never reaches the internal network (dedicated egress path) |
+| Push token invalid (`Unregistered`/`BadDeviceToken`) | provider permanent error | one fewer device gets it | **not retried** — token pruned (`active:false`); other devices unaffected |
+| SMS recipient opted out | `SmsConsent = opted_out` at send | no SMS (by law) | suppressed + audited `suppressed:opted_out`; in-app/email still deliver |
+| SMS budget exhausted | per-tenant SMS spend alarm | no SMS for that tenant | degrade to no-SMS + admin alert — never a surprise bill |
+| **Fan-out resolved mid-flight** | resolve lands before a later wave delivers | **recipient X is never notified** | delivery-time resolved-check (§3.3) suppresses X's not-yet-delivered copy — no item written, `suppressed:already-resolved`; already-delivered recipients get a REMOVE (diagram `f11`) |
 | Poison message | any DLQ > 0 | one notification delayed | maxReceive → DLQ, alarm at 1, idempotent redrive |
 | EventBridge mapping drift | shadow diff ≠ expected; hourly canary silent | possibly missing notifications | strict templates render-error → DLQ; canary alarms; archive-replay the gap |
 
-Retry policy per boundary: full-jitter exponential backoff everywhere; DLQ after 5–6 receives; config/template errors are non-retryable → DLQ immediately with reason. (Enricher specifics in §4.2.)
+Retry policy per boundary: full-jitter exponential backoff everywhere; DLQ after 5–6 receives; config/template errors are non-retryable → DLQ immediately with reason. (Enricher specifics in §4.2; per-channel specifics in §3.6.)
 
 ---
 
