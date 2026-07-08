@@ -282,17 +282,18 @@ const FLOWS = {
     actors: ["Admin", "Endpoint reg", "Webhook λ", "SSRF guard", "Tenant HTTPS", "webhook-DLQ"],
     steps: [
       { note: "① register: POST /v1/admin/webhooks → signed verification challenge, must echo nonce ⇒ status active" },
-      { f: 0, t: 1, label: "register {url, subscribedTypes[]} · secret in Secrets Mgr" },
+      { f: 0, t: 1, label: "register {url, subscribedTypes[]} · HMAC secret + Bearer token (both in Secrets Mgr)" },
       { f: 2, t: 4, label: "endpoint.verification (signed) → echo nonce ⇒ active", dashed: true },
       { note: "② deliver — resolvable types re-check ResolutionGroup first (suppress if resolved)" },
       { f: 2, t: 1, label: "list active endpoints where subscribedTypes ∋ typeId" },
       { f: 2, t: 3, label: "resolve host → validate PUBLIC ip → pin ip (no redirects)" },
       { note: "private / link-local / 169.254 metadata IP ⇒ BLOCKED, audited webhook_blocked:ssrf — never reaches the VPC" },
-      { f: 2, t: 4, label: "POST body + X-CNS-Signature: HMAC-SHA256(secret, ts.body) + notifId", tone: "accent" },
+      { f: 2, t: 4, label: "POST + Authorization: Bearer (edge auth) + X-CNS-Signature v1=HMAC(current),v1=HMAC(previous) + notifId", tone: "accent" },
       { f: 4, t: 2, label: "2xx ⇒ delivered (DeliveryRecord sending→delivered)", dashed: true },
       { note: "non-2xx / timeout ⇒ full-jitter retry (honor Retry-After); breaker opens → endpoint auto-disabled + tenant alerted" },
       { f: 2, t: 5, label: "maxReceiveCount → webhook-DLQ (ALARM)" },
-      { note: "consumer contract: verify signature · reject if |now−ts|>5m · 2xx fast · idempotent on notifId · at-least-once" },
+      { note: "consumer contract: check Bearer at the edge + verify signature over raw body · reject if |now−ts|>5m · idempotent on notifId" },
+      { note: "③ rotate (admin): rotate-secret ⇒ dual v1= signatures during overlap · rotate-token ⇒ make-before-break — both zero-gap, audited" },
     ],
   },
   f8: {
@@ -399,7 +400,7 @@ const entities = [
   ["DeliveryRecord", "outbox per notifId·channel: sending→sent|failed|suppressed + providerMsgId"],
   ["IdempotencyKey", "tenant#eventId, TTL 48 h — duplicate producer calls are free"],
   ["AuditEvent", "auditId = notifId#stage#attempt (idempotent) · stage · outcome · reason — no payload, recipient as HMAC token; new: enrich_* · webhook_* · push_* · sms_* · suppressed:already-resolved"],
-  ["WebhookEndpoint (new)", "tenant#endpointId · url · secretRef (HMAC key) · subscribedTypes[] · status(pending|active|disabled) · breakerState · consecutiveFailures · mTLS — §3.6.1"],
+  ["WebhookEndpoint (new)", "tenant#endpointId · url · secretRef (HMAC) + bearerTokenRef — two independently rotatable creds, each current+previous overlap (rotationOverlapHours, *RotatedAt) · subscribedTypes[] · status(pending|active|disabled) · breakerState · mTLS — §3.6.1"],
   ["DeviceToken (new)", "tenant#user · device#id · platform(ios|android|web) · token · appVersion · locale · active — pruned on provider 'unregistered' — §3.6.2"],
   ["SmsConsent (new)", "tenant#user (or phone#hash) · status(opted_in|opted_out) · source · updatedAt — STOP/HELP driven suppression — §3.6.3"],
   ["Recipient kinds", "user · role · externalEmail · slackChannel + externalPhone (SMS to a non-user number)"],
@@ -417,7 +418,7 @@ const channelCatalog = [
 
 const webhookAtoZ = [
   { t: "A · Register + verify", d: "Admin registers {url, subscribedTypes[]}; CNS POSTs a signed verification challenge the endpoint must echo before status flips pending→active. Proves ownership, catches typo'd URLs before any real event." },
-  { t: "B · Sign every request", d: "X-CNS-Signature: t=<ts>,v1=HMAC-SHA256(secret, ts.body). The consumer recomputes over raw bytes (constant-time) to authenticate CNS + verify integrity; the signed timestamp lets it reject replays (>5 min). Dual-sign window = zero-downtime secret rotation." },
+  { t: "B · Two-layer auth — bearer + HMAC, both rotatable", d: "Layer 1 — Authorization: Bearer <token>: an opaque per-endpoint secret in a standard header, so the consumer's edge (API GW / WAF) can reject non-CNS traffic BEFORE app code. Layer 2 — X-CNS-Signature: t=<ts>,v1=HMAC-SHA256(secret, ts.body): recomputed over raw bytes (constant-time) for body integrity + replay rejection (>5 min). CNS always sends both; belt-and-suspenders. Both credentials are INDEPENDENTLY ROTATABLE with a current+previous overlap (default 48h): HMAC rotation is coordination-free (two v1= signatures during the window); bearer rotation is make-before-break (tenant adds the new token, then the old is revoked). The admin panel shows both, masked, with last-rotated + overlap expiry." },
   { t: "C · SSRF / egress hardening (load-bearing)", d: "URL is tenant-controlled, so: HTTPS only · resolve DNS + validate every IP is PUBLIC (block RFC-1918, loopback, 169.254 metadata) · PIN the validated IP for the connection (defeats DNS-rebinding TOCTOU) · no redirects · dedicated egress subnet that can't reach the VPC. A payroll service must never be tricked into hitting an internal host." },
   { t: "D · Reliability & backpressure", d: "Outbox DeliveryRecord before send; 2xx=success; non-2xx/timeout ⇒ full-jitter retry (honor Retry-After) → webhook-DLQ (alarm@1). Per-endpoint circuit breaker auto-disables a chronically-failing endpoint (+ tenant alert) — one bad endpoint never becomes an infinite bill. Per-endpoint bulkhead so one slow tenant can't starve the Lambda pool." },
   { t: "E · Consumer contract", d: "Return 2xx fast (slow work async) · verify the signature · treat as at-least-once + idempotent on X-CNS-Notif-Id · tolerate out-of-order (use occurredAt)." },
@@ -835,6 +836,18 @@ POST /v1/admin/dlq/{queue}/redrive      // one-click, idempotent-safe — also t
 
 { "tenantId":"org_912", "monthlyTokenCap": 25000000,
   "perType": {"wallet.underfunded": 2000000}, "onExhaust": "park+alert" }`}</Code>
+          <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Admin — webhook endpoints (two rotatable credentials)</div>
+          <Code>{`CRUD /v1/admin/webhooks                     // url, subscribedTypes[], headers
+                                            // HMAC secret + Bearer token auto-generated, shown once
+POST /v1/admin/webhooks/{id}/verify         // (re)send the signed verification challenge
+POST /v1/admin/webhooks/{id}/rotate-secret  // HMAC — dual-sign overlap window (coordination-free)
+POST /v1/admin/webhooks/{id}/rotate-token   // Bearer — make-before-break  { "overlapHours": 48 }
+GET  /v1/admin/webhooks/{id}/credentials    // masked current+previous of BOTH · *RotatedAt · expiry
+POST /v1/admin/webhooks/{id}/enable         // clear the breaker after a fix
+
+// device + consent (push / SMS) + SMS spend cap
+registerDevice / unregisterDevice / setSmsConsent   // AppSync mutations (tenant#user from JWT)
+CRUD /v1/admin/tenants/{id}/sms-budget              // per-tenant SMS spend/rate cap`}</Code>
         </Section>
 
         <Section id="data" title="Data model — the load-bearing keys">

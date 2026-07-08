@@ -167,8 +167,12 @@ An **outbound** webhook: CNS delivers a notification to an HTTPS endpoint the te
 // WebhookEndpoint — one per registered tenant endpoint
 {
   "PK": "tenant#org_912", "SK": "endpoint#ep_7f3",
-  "url": "https://hooks.acme.example/cns",          // HTTPS only
-  "secretRef": "secretsmanager://cns/webhook/ep_7f3", // HMAC signing key (32B+), rotatable
+  "url": "https://hooks.acme.example/cns",             // HTTPS only
+  // — two independent, rotatable credentials, both in Secrets Manager —
+  "secretRef":      "secretsmanager://cns/webhook/ep_7f3/hmac",   // HMAC signing key (32B+)
+  "bearerTokenRef": "secretsmanager://cns/webhook/ep_7f3/bearer", // Authorization: Bearer token
+  "secretRotatedAt": "2026-07-01T…", "bearerRotatedAt": "2026-06-15T…",
+  "rotationOverlapHours": 48,     // both keep the previous version valid this long
   "subscribedTypes": ["wallet.underfunded", "payroll.approval.required"], // or ["*"]
   "status": "active",            // pending → active → disabled (auto or manual)
   "customHeaders": {"X-Acme-Env": "prod"},           // static, non-secret only
@@ -176,6 +180,8 @@ An **outbound** webhook: CNS delivers a notification to an HTTPS endpoint the te
   "verifiedAt": "2026-07-08T…", "createdBy": "admin@org_912", "mTLS": false
 }
 ```
+
+Each Secrets Manager secret holds **two concurrently-valid versions** (`current` + `previous`) during a rotation window, which is what makes both credentials rotatable with zero delivery gap (bullet D2).
 
 **B. Registration + verification handshake.** An admin registers the endpoint via the admin API (§6). CNS immediately POSTs a signed `endpoint.verification` challenge (`{challengeId, nonce}`); the endpoint must echo the nonce (or return `2xx` with the expected body) within a short window. Only then does `status` flip `pending → active`. This proves ownership, catches typo'd URLs before any real event, and is auditable (`webhook_verified`). Re-verification can be forced after a URL change.
 
@@ -188,12 +194,13 @@ POST /cns HTTP/1.1
 Host: hooks.acme.example
 Content-Type: application/json
 User-Agent: CNS-Webhook/1.0
+Authorization: Bearer <opaque per-endpoint token>   # layer 1: coarse caller auth (edge-checkable)
 X-CNS-Event-Id: pay-run-8812-approval          # producer eventId
 X-CNS-Notif-Id: 3f9c…                           # deterministic; the idempotency key
 X-CNS-Delivery-Id: d_01H…                        # unique per attempt
 X-CNS-Type: payroll.approval.required
 X-CNS-Timestamp: 1751971200                      # unix seconds, signed
-X-CNS-Signature: t=1751971200,v1=<hex hmac-sha256>
+X-CNS-Signature: t=1751971200,v1=<hmac current>,v1=<hmac previous>  # layer 2: body integrity + replay
 Idempotency-Key: 3f9c…                           # == notifId
 
 { "type":"payroll.approval.required", "tenantId":"org_912",
@@ -201,7 +208,18 @@ Idempotency-Key: 3f9c…                           # == notifId
   "data": { … allow-listed / rendered fields … } }
 ```
 
-- **Signature.** `v1 = HMAC-SHA256(secret, "{timestamp}.{raw-body}")`, hex. The consumer recomputes it over the *raw* bytes and compares in constant time — this authenticates CNS and guarantees body integrity. The signed timestamp lets the consumer **reject replays** (drop if `|now − timestamp| > 5 min`). Two signatures can be sent during secret rotation (`v1=…,v1=…`) so rotation is zero-downtime.
+**D2. Two-layer authentication — bearer token *and* HMAC signature.** CNS presents **two independent credentials** on every request, and each guards a different thing at a different tier. This is deliberate belt-and-suspenders: an attacker would have to defeat both, and each is checkable where it's cheapest.
+
+- **Layer 1 — bearer token** (`Authorization: Bearer <token>`). An opaque, high-entropy per-endpoint secret that answers the coarse question *"is this request even from CNS?"* Its value is that it sits in a **standard `Authorization` header**, so the consumer's **edge** — an API gateway, ALB, or WAF — can reject non-CNS traffic *before it ever reaches application code* (and before the body is parsed). The consumer compares it in constant time.
+- **Layer 2 — HMAC signature** (`X-CNS-Signature`). `v1 = HMAC-SHA256(secret, "{timestamp}.{raw-body}")`, hex. Recomputed over the *raw* bytes and compared constant-time at the app tier, it proves the **body was not tampered with** and — via the signed timestamp — lets the consumer **reject replays** (`|now − timestamp| > 5 min`). The bearer token alone can be replayed if TLS is terminated and logged upstream; the HMAC closes that, because a replay of a stale body fails the timestamp+signature check.
+- **Why both, not one.** The bearer is a cheap edge gate but says nothing about body integrity or freshness; the HMAC gives integrity + replay protection but many consumers can't compute it at the WAF/edge. Requiring both means the perimeter drops obvious noise on a header check while the app still cryptographically verifies each accepted message. Consumers may enforce either or both; CNS always sends both.
+
+**D3. Both credentials are independently rotatable — zero delivery gap.** Each lives in its own Secrets Manager secret with a **`current` + `previous`** overlap window (`rotationOverlapHours`, default 48h). Admin-initiated (or scheduled) via §6.4, every rotation audited (`webhook_secret_rotated` / `webhook_token_rotated`):
+
+- **HMAC secret rotation** is *coordination-free*: during the window CNS emits **two `v1=` signatures** (one per key version) in the same header, so the consumer validates against either and needs no timing coordination. After the window the `previous` key is dropped and CNS emits one signature again.
+- **Bearer token rotation** is *make-before-break*: `rotate-token` provisions a new value while the previous stays valid; the tenant adds the new token to their edge accept-list during the overlap; CNS switches to sending the new token; after the window the previous is revoked. The admin panel surfaces both `current` and `previous` (masked, with a copy-once reveal) plus each secret's `*RotatedAt` and the overlap expiry, so the tenant always knows what's live.
+- Verification uses the *current* bearer/secret; a rotated endpoint does **not** require re-running the §B verification handshake.
+
 - **Thin vs fat.** Default **fat** (the rendered `data` inline) because the destination is the tenant's *own* system receiving its *own* tenant's data over TLS. A per-endpoint `thin: true` option sends only `{type, notifId, entityRef}` and the consumer pulls the detail from `GET /v1/notifications/{id}/status` — for tenants who prefer to authenticate a pull rather than trust a push.
 
 **E. SSRF / egress hardening — the load-bearing security control.** The URL is attacker-influenceable (a compromised tenant admin), so the `Webhook λ`:
@@ -217,7 +235,7 @@ Idempotency-Key: 3f9c…                           # == notifId
 - **Per-endpoint circuit breaker.** Consecutive failures past a threshold open the breaker: deliveries for that endpoint short-circuit to a park state, the tenant admin is alerted, and after sustained failure the endpoint is **auto-disabled** (`status → disabled`) exactly as Stripe/GitHub do — one broken endpoint never becomes an infinite retry bill. A half-open probe (or manual re-enable) restores it.
 - **Bulkhead.** A per-endpoint concurrency cap / token bucket means one slow tenant endpoint cannot consume the whole `Webhook λ` reserved-concurrency pool and starve other tenants (noisy-neighbor isolation).
 
-**G. Consumer contract (documented for tenants).** Return `2xx` within a few seconds and do slow work async; **verify the signature** before trusting the body; treat delivery as **at-least-once** and **idempotent on `X-CNS-Notif-Id`**; tolerate out-of-order arrival (use `occurredAt`); expect redelivery after any non-2xx.
+**G. Consumer contract (documented for tenants).** Return `2xx` within a few seconds and do slow work async; **check the `Authorization: Bearer` token** (ideally at the edge) **and verify the `X-CNS-Signature`** over the raw body before trusting it — accept a request whose signature matches *any* `v1=` value and whose bearer matches the current *or* previous token during a rotation window; treat delivery as **at-least-once** and **idempotent on `X-CNS-Notif-Id`**; tolerate out-of-order arrival (use `occurredAt`); expect redelivery after any non-2xx.
 
 **H. Observability & audit.** Per-attempt audit `webhook_attempt{endpointId, httpStatus, latency, attempt}`, `webhook_delivered | webhook_failed | webhook_disabled`; the golden dashboard shows per-endpoint success rate, p99 latency, breaker state, and DLQ depth. Endpoint URLs are config (not PII); no payload is stored in audit (hash + status only).
 
@@ -347,7 +365,7 @@ Unchanged from v1.3 §10.6 (T1 design-time author + T2 signature-gated runtime r
 | `InboxItem` | unchanged keys (`PK tenant#user`, `SK createdAt#notifId`, GSI on `groupKey`, `expiresAt` TTL) — **`contentVersion`/`enrichedAt` removed**: one version only |
 | `ResolutionGroup`, `DeliveryRecord` (outbox), `IdempotencyKey`, `AuditEvent` | unchanged (`DeliveryRecord.channel` enum + `httpStatus`/`attempt` now also cover webhook/push/sms) |
 | `Connection` (WebSocket registry) | **deleted — AppSync manages connections** |
-| **`WebhookEndpoint`** (new) | `PK tenant#endpointId` · `url`, `secretRef`, `subscribedTypes[]`, `status(pending\|active\|disabled)`, `breakerState`, `consecutiveFailures`, `customHeaders`, `mTLS`, `verifiedAt` — §3.6.1 |
+| **`WebhookEndpoint`** (new) | `PK tenant#endpointId` · `url`, **`secretRef` (HMAC) + `bearerTokenRef` — two independently rotatable credentials, each with a `current`/`previous` overlap** (`rotationOverlapHours`, `secretRotatedAt`, `bearerRotatedAt`), `subscribedTypes[]`, `status(pending\|active\|disabled)`, `breakerState`, `consecutiveFailures`, `customHeaders`, `mTLS`, `verifiedAt` — §3.6.1 |
 | **`DeviceToken`** (new) | `PK tenant#user`, `SK device#id` · `platform(ios\|android\|web)`, `token`, `appVersion`, `locale`, `active`, `lastSeenAt` — pruned on provider "unregistered" — §3.6.2 |
 | **`SmsConsent`** (new) | `PK tenant#user` (or `phone#hash`) · `status(opted_in\|opted_out)`, `source`, `updatedAt` — STOP/HELP driven suppression — §3.6.3 |
 | `NotificationType.channels` enum | gains **`webhook`, `push`, `sms`** with per-channel settings (`push.contentPolicy`, `push.collapseKey`, `push.ttl`, `sms.contentPolicy`, `sms.maxSegments`, `sms.senderIdPolicy`, webhook via tenant endpoint registry) |
@@ -393,11 +411,19 @@ Unchanged: CRUD types/templates/mappings/org-overrides/ai-budgets, template prom
 
 ```
 CRUD /v1/admin/webhooks                     register / update / disable tenant endpoints
+                                            (set url, subscribedTypes[], custom headers;
+                                             HMAC secret + bearer token auto-generated, shown once)
 POST /v1/admin/webhooks/{id}/verify         (re)send the signed verification challenge
-POST /v1/admin/webhooks/{id}/rotate-secret  dual-sign window for zero-downtime rotation
+POST /v1/admin/webhooks/{id}/rotate-secret  rotate the HMAC signing secret (dual-sign overlap window)
+POST /v1/admin/webhooks/{id}/rotate-token   rotate the Authorization: Bearer token (make-before-break)
+     { "overlapHours": 48 }                 optional per-rotation overlap; both default to 48h
+GET  /v1/admin/webhooks/{id}/credentials    masked current + previous of BOTH secrets, *RotatedAt,
+                                            overlap expiry — the admin-panel rotation view
 POST /v1/admin/webhooks/{id}/enable         clear the breaker after a fix
 CRUD /v1/admin/tenants/{id}/sms-budget      per-tenant SMS spend/rate cap (TenantAiBudget pattern)
 ```
+
+The admin panel exposes both credentials side by side: a **Rotate secret** and a **Rotate token** action, each showing `current`/`previous` (masked, copy-once reveal), the last-rotated timestamp, and when the overlap window closes — so an operator can rotate either credential on its own schedule without ever dropping a delivery.
 
 ---
 
