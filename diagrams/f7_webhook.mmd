@@ -13,7 +13,7 @@ sequenceDiagram
 
     Note over ADM,SEC: ① REGISTER + VERIFY (once)
     ADM->>API: POST /v1/admin/webhooks {url, subscribedTypes[]}
-    API->>SEC: create signing secret
+    API->>SEC: create HMAC secret + Bearer token (both shown once)
     API->>REG: PutItem status=pending
     API->>EP: POST endpoint.verification {challengeId, nonce} (signed)
     alt endpoint echoes nonce (2xx)
@@ -37,7 +37,8 @@ sequenceDiagram
         Note over WH: audit: webhook_blocked:ssrf — never leaves egress subnet
     else public IP, pinned
         DNS-->>WH: ok (connect to pinned IP, SNI=host, no redirects)
-        WH->>EP: POST body + X-CNS-Signature: t,v1=HMAC-SHA256(secret, ts.body)<br/>X-CNS-Notif-Id (idempotency) · X-CNS-Timestamp
+        WH->>SEC: get Bearer token + HMAC secret (current + previous)
+        WH->>EP: POST body<br/>Authorization: Bearer TOKEN (layer 1 — edge-checkable)<br/>X-CNS-Signature: t,v1=HMAC(current),v1=HMAC(previous) (layer 2)<br/>X-CNS-Notif-Id (idempotency) · X-CNS-Timestamp
         alt 2xx
             EP-->>WH: 2xx
             Note over WH: DeliveryRecord sending→delivered · audit: webhook_delivered
@@ -48,4 +49,12 @@ sequenceDiagram
             WQ->>DLQ: after maxReceiveCount → ALARM · audit: webhook_failed
         end
     end
-    Note over EP: consumer contract: verify signature · reject if |now−ts|>5m ·<br/>2xx fast · idempotent on notifId · tolerate at-least-once + out-of-order
+    Note over EP: consumer contract: check Bearer (at the edge) AND verify signature over raw body ·<br/>accept any v1= and current-or-previous token during rotation · reject if |now−ts|>5m ·<br/>2xx fast · idempotent on notifId · tolerate at-least-once + out-of-order
+
+    Note over ADM,SEC: ③ ROTATE — both credentials, independently, zero delivery gap
+    ADM->>API: POST /v1/admin/webhooks/{id}/rotate-secret {overlapHours:48}
+    Note over API,SEC: HMAC: new + previous both valid → CNS sends TWO v1= signatures during window
+    ADM->>API: POST /v1/admin/webhooks/{id}/rotate-token {overlapHours:48}
+    Note over API,SEC: Bearer: make-before-break — tenant adds new to accept-list, then previous revoked
+    ADM->>API: GET /v1/admin/webhooks/{id}/credentials
+    API-->>ADM: masked current + previous of BOTH · *RotatedAt · overlap expiry

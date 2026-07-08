@@ -59,7 +59,7 @@ Six channels ship in v1.4: **in-app, email, Slack** (original) and **webhook, mo
 
 ![Component overview](../diagrams/v14_components.png)
 
-**Sequence diagrams** (sources in [`../diagrams/`](../diagrams/)): `f1_explicit` (explicit single-user), `f2_fanout` (bus fan-out + implicit resolve), `f3_enrichment` (the AI gate), `f4_inbox` (AppSync read/resolve), `f5_triage` (AI event triage), `f6_counter` (unread-counter ladder), `f7_webhook`, `f8_push`, `f9_sms` (the three new channels, §3.6), `f10_login_to_inbox` (full flow: login → JWT → subscribe → device register → notification → Bell, §7), and `f11_resolve_race` (fan-out resolved mid-flight — a recipient is **never** notified, §7).
+**Sequence diagrams** (sources in [`../diagrams/`](../diagrams/)): `f1_explicit` (explicit single-user), `f2_fanout` (bus fan-out + implicit resolve), `f3_enrichment` (the AI gate), `f4_inbox` (AppSync read/resolve), `f5_triage` (AI event triage), `f6_counter` (unread-counter ladder), `f7_webhook`, `f8_push`, `f9_sms` (the three new channels, §3.6), `f10_login_to_inbox` (full flow: login → JWT → subscribe → device register → notification → Bell, §7), `f11_resolve_race` (fan-out resolved mid-flight — a recipient is **never** notified, §7), and `f12_webhook_admin` (tenant admin panel: delivery visibility + replay by single message / time-frame / filtered type, §3.6.5).
 
 ### 3.1 Intake λ — the only place events enter
 
@@ -140,7 +140,7 @@ enum InboxEventKind { UPSERT REMOVE BADGE }   # REMOVE reason: resolved | expire
 
 - **Config store:** `NotificationType`, templates (versioned, draft→shadow→active), bus mappings (notify/resolve, shadow-mode first), org overrides, `TenantAiBudget`. Admin API is internal OIDC, every write versioned + cache-busting, exactly as v1.3 §9.4.
 - **Audit:** dual-plane, unchanged from v1.3 §11 — authoritative state written with the side-effect it describes; analytical trail (idempotent `auditId = notifId#stage#attempt`) via Firehose → S3 Parquet + Athena, 7-day hot index; daily reconciliation with drift alarm; PII never in the trail. New v1.4 audit events for the AI gate: `enrich_waiting`, `enrich_retry{reason,attempt}`, `enrich_dlq{reason}`, `redriven`.
-- **Observability:** golden dashboard — ingest rate, per-queue oldest-message-age, per-channel success and delivery p99, **all DLQ depths (steady state 0)**, enrichment retry/DLQ rate and budget burn, AppSync connection/publish errors, SES bounce/complaint, per-endpoint webhook health, push token-invalidation rate, SMS opt-out and spend, top-10 tenants by volume.
+- **Observability:** golden dashboard — ingest rate, per-queue oldest-message-age, per-channel success and delivery p99, **all DLQ depths (steady state 0)**, enrichment retry/DLQ rate and budget burn, AppSync connection/publish errors, SES bounce/complaint, per-endpoint webhook health, push token-invalidation rate, SMS opt-out and spend, top-10 tenants by volume. The **tenant-facing** webhook panel (§3.6.5) is a scoped read over this same audit data. New audit events for replay: `replay_requested{selection, count, principal}`, `webhook_replayed`, `replay_skipped:expired`.
 
 ### 3.6 Channel catalog — email, Slack, in-app, and the three new adapters
 
@@ -167,8 +167,12 @@ An **outbound** webhook: CNS delivers a notification to an HTTPS endpoint the te
 // WebhookEndpoint — one per registered tenant endpoint
 {
   "PK": "tenant#org_912", "SK": "endpoint#ep_7f3",
-  "url": "https://hooks.acme.example/cns",          // HTTPS only
-  "secretRef": "secretsmanager://cns/webhook/ep_7f3", // HMAC signing key (32B+), rotatable
+  "url": "https://hooks.acme.example/cns",             // HTTPS only
+  // — two independent, rotatable credentials, both in Secrets Manager —
+  "secretRef":      "secretsmanager://cns/webhook/ep_7f3/hmac",   // HMAC signing key (32B+)
+  "bearerTokenRef": "secretsmanager://cns/webhook/ep_7f3/bearer", // Authorization: Bearer token
+  "secretRotatedAt": "2026-07-01T…", "bearerRotatedAt": "2026-06-15T…",
+  "rotationOverlapHours": 48,     // both keep the previous version valid this long
   "subscribedTypes": ["wallet.underfunded", "payroll.approval.required"], // or ["*"]
   "status": "active",            // pending → active → disabled (auto or manual)
   "customHeaders": {"X-Acme-Env": "prod"},           // static, non-secret only
@@ -176,6 +180,8 @@ An **outbound** webhook: CNS delivers a notification to an HTTPS endpoint the te
   "verifiedAt": "2026-07-08T…", "createdBy": "admin@org_912", "mTLS": false
 }
 ```
+
+Each Secrets Manager secret holds **two concurrently-valid versions** (`current` + `previous`) during a rotation window, which is what makes both credentials rotatable with zero delivery gap (bullet D2).
 
 **B. Registration + verification handshake.** An admin registers the endpoint via the admin API (§6). CNS immediately POSTs a signed `endpoint.verification` challenge (`{challengeId, nonce}`); the endpoint must echo the nonce (or return `2xx` with the expected body) within a short window. Only then does `status` flip `pending → active`. This proves ownership, catches typo'd URLs before any real event, and is auditable (`webhook_verified`). Re-verification can be forced after a URL change.
 
@@ -188,12 +194,13 @@ POST /cns HTTP/1.1
 Host: hooks.acme.example
 Content-Type: application/json
 User-Agent: CNS-Webhook/1.0
+Authorization: Bearer <opaque per-endpoint token>   # layer 1: coarse caller auth (edge-checkable)
 X-CNS-Event-Id: pay-run-8812-approval          # producer eventId
 X-CNS-Notif-Id: 3f9c…                           # deterministic; the idempotency key
 X-CNS-Delivery-Id: d_01H…                        # unique per attempt
 X-CNS-Type: payroll.approval.required
 X-CNS-Timestamp: 1751971200                      # unix seconds, signed
-X-CNS-Signature: t=1751971200,v1=<hex hmac-sha256>
+X-CNS-Signature: t=1751971200,v1=<hmac current>,v1=<hmac previous>  # layer 2: body integrity + replay
 Idempotency-Key: 3f9c…                           # == notifId
 
 { "type":"payroll.approval.required", "tenantId":"org_912",
@@ -201,7 +208,18 @@ Idempotency-Key: 3f9c…                           # == notifId
   "data": { … allow-listed / rendered fields … } }
 ```
 
-- **Signature.** `v1 = HMAC-SHA256(secret, "{timestamp}.{raw-body}")`, hex. The consumer recomputes it over the *raw* bytes and compares in constant time — this authenticates CNS and guarantees body integrity. The signed timestamp lets the consumer **reject replays** (drop if `|now − timestamp| > 5 min`). Two signatures can be sent during secret rotation (`v1=…,v1=…`) so rotation is zero-downtime.
+**D2. Two-layer authentication — bearer token *and* HMAC signature.** CNS presents **two independent credentials** on every request, and each guards a different thing at a different tier. This is deliberate belt-and-suspenders: an attacker would have to defeat both, and each is checkable where it's cheapest.
+
+- **Layer 1 — bearer token** (`Authorization: Bearer <token>`). An opaque, high-entropy per-endpoint secret that answers the coarse question *"is this request even from CNS?"* Its value is that it sits in a **standard `Authorization` header**, so the consumer's **edge** — an API gateway, ALB, or WAF — can reject non-CNS traffic *before it ever reaches application code* (and before the body is parsed). The consumer compares it in constant time.
+- **Layer 2 — HMAC signature** (`X-CNS-Signature`). `v1 = HMAC-SHA256(secret, "{timestamp}.{raw-body}")`, hex. Recomputed over the *raw* bytes and compared constant-time at the app tier, it proves the **body was not tampered with** and — via the signed timestamp — lets the consumer **reject replays** (`|now − timestamp| > 5 min`). The bearer token alone can be replayed if TLS is terminated and logged upstream; the HMAC closes that, because a replay of a stale body fails the timestamp+signature check.
+- **Why both, not one.** The bearer is a cheap edge gate but says nothing about body integrity or freshness; the HMAC gives integrity + replay protection but many consumers can't compute it at the WAF/edge. Requiring both means the perimeter drops obvious noise on a header check while the app still cryptographically verifies each accepted message. Consumers may enforce either or both; CNS always sends both.
+
+**D3. Both credentials are independently rotatable — zero delivery gap.** Each lives in its own Secrets Manager secret with a **`current` + `previous`** overlap window (`rotationOverlapHours`, default 48h). Admin-initiated (or scheduled) via §6.4, every rotation audited (`webhook_secret_rotated` / `webhook_token_rotated`):
+
+- **HMAC secret rotation** is *coordination-free*: during the window CNS emits **two `v1=` signatures** (one per key version) in the same header, so the consumer validates against either and needs no timing coordination. After the window the `previous` key is dropped and CNS emits one signature again.
+- **Bearer token rotation** is *make-before-break*: `rotate-token` provisions a new value while the previous stays valid; the tenant adds the new token to their edge accept-list during the overlap; CNS switches to sending the new token; after the window the previous is revoked. The admin panel surfaces both `current` and `previous` (masked, with a copy-once reveal) plus each secret's `*RotatedAt` and the overlap expiry, so the tenant always knows what's live.
+- Verification uses the *current* bearer/secret; a rotated endpoint does **not** require re-running the §B verification handshake.
+
 - **Thin vs fat.** Default **fat** (the rendered `data` inline) because the destination is the tenant's *own* system receiving its *own* tenant's data over TLS. A per-endpoint `thin: true` option sends only `{type, notifId, entityRef}` and the consumer pulls the detail from `GET /v1/notifications/{id}/status` — for tenants who prefer to authenticate a pull rather than trust a push.
 
 **E. SSRF / egress hardening — the load-bearing security control.** The URL is attacker-influenceable (a compromised tenant admin), so the `Webhook λ`:
@@ -217,7 +235,7 @@ Idempotency-Key: 3f9c…                           # == notifId
 - **Per-endpoint circuit breaker.** Consecutive failures past a threshold open the breaker: deliveries for that endpoint short-circuit to a park state, the tenant admin is alerted, and after sustained failure the endpoint is **auto-disabled** (`status → disabled`) exactly as Stripe/GitHub do — one broken endpoint never becomes an infinite retry bill. A half-open probe (or manual re-enable) restores it.
 - **Bulkhead.** A per-endpoint concurrency cap / token bucket means one slow tenant endpoint cannot consume the whole `Webhook λ` reserved-concurrency pool and starve other tenants (noisy-neighbor isolation).
 
-**G. Consumer contract (documented for tenants).** Return `2xx` within a few seconds and do slow work async; **verify the signature** before trusting the body; treat delivery as **at-least-once** and **idempotent on `X-CNS-Notif-Id`**; tolerate out-of-order arrival (use `occurredAt`); expect redelivery after any non-2xx.
+**G. Consumer contract (documented for tenants).** Return `2xx` within a few seconds and do slow work async; **check the `Authorization: Bearer` token** (ideally at the edge) **and verify the `X-CNS-Signature`** over the raw body before trusting it — accept a request whose signature matches *any* `v1=` value and whose bearer matches the current *or* previous token during a rotation window; treat delivery as **at-least-once** and **idempotent on `X-CNS-Notif-Id`**; tolerate out-of-order arrival (use `occurredAt`); expect redelivery after any non-2xx.
 
 **H. Observability & audit.** Per-attempt audit `webhook_attempt{endpointId, httpStatus, latency, attempt}`, `webhook_delivered | webhook_failed | webhook_disabled`; the golden dashboard shows per-endpoint success rate, p99 latency, breaker state, and DLQ depth. Endpoint URLs are config (not PII); no payload is stored in audit (hash + status only).
 
@@ -268,6 +286,46 @@ The most expensive and most regulated channel — reserved for high-priority typ
 - **Data model:** `WebhookEndpoint`, `DeviceToken`, `SmsConsent` entities; recipient kinds gain `externalPhone`; `NotificationType.channels` enum gains `webhook | push | sms` with per-channel settings (§5).
 - **Public surfaces:** admin CRUD for webhook endpoints (+ verify/rotate), AppSync `registerDevice`/`unregisterDevice` mutations, SMS consent + budget config (§6).
 - **Everything else is unchanged:** same idempotency, same audit contract (new per-channel events), same DLQ+alarm discipline, same delivery-time resolved-check. Adding these channels required **zero** changes to the Intake λ, the SNS topic, the AI gate, or the AppSync inbox surface — which is the whole point.
+
+---
+
+#### 3.6.5 Webhook delivery visibility & replay (the tenant admin panel)
+
+Once a tenant is receiving webhooks they need to answer two operational questions themselves: *"what did CNS send me, and what failed?"* and *"re-send me the ones I missed."* Both are served from data CNS **already captures** — the per-attempt audit events and the `DeliveryRecord` outbox — so this is a read/re-enqueue feature, not new storage. Full flow: diagram [`f12_webhook_admin`](../diagrams/f12_webhook_admin.png).
+
+**A. Visibility — what the tenant sees.** All tenant-scoped (JWT pins them to their own `tenantId`), read from the **7-day hot audit index** (DynamoDB) for the live panel and **Athena over S3 Parquet** for older windows (partitioned `dt/type/tenant`, which is exactly the shape these filters need):
+
+- **Per-endpoint rollups / calculations:** `sent`, `delivered`, `failed`, `suppressed`; **success rate**; **p50/p99 latency**; HTTP **status-code breakdown**; volume by `typeId`; current `breakerState` and `consecutiveFailures`; last-delivery timestamp — over any `from`/`to` window.
+- **Delivery log:** one row per attempt — `notifId`, `typeId`, timestamp, `httpStatus`, latency, `attempt`, outcome (`delivered | failed | suppressed | replayed`), and the failure `reason` — searchable and filterable by endpoint, type, status, and time range, cursor-paginated.
+- **Single-delivery drill-in:** every attempt for one `notifId` plus the response code.
+
+```
+GET /v1/admin/webhooks/{id}/stats?from&to                       # rollups / calculations
+GET /v1/admin/webhooks/{id}/deliveries?from&to&type&status&cursor  # delivery log (filterable)
+GET /v1/admin/webhooks/{id}/deliveries/{notifId}                # single-delivery detail
+```
+
+**B. Replay — one message, a whole time-frame, or a filtered time-frame.** The same three selection modes the requirement asks for, all through one endpoint:
+
+```
+POST /v1/admin/webhooks/{id}/replay
+  { "notifId": "3f9c…" }                                        # ① a single message
+  { "from": "...", "to": "..." }                                # ② a whole time-frame
+  { "from": "...", "to": "...",                                 # ③ filtered time-frame
+    "types": ["walletX","walletY"], "excludeTypes": ["walletZ"],
+    "status": "failed", "dryRun": true }                        # e.g. only X,Y — not Z — that failed
+```
+
+Mechanics, kept deliberately simple by reusing what already exists:
+
+1. **Resolve the selection** against the audit index/Athena into a concrete set of `notifId`s.
+2. **Dry-run first** (`dryRun:true`, the default for a range) returns the **count + a sample** and sends nothing — so an operator never fires a 200k-message replay blind.
+3. On confirm, CNS **enqueues replay tasks onto `webhook-q`** in **paced waves** (the same pacing as a large fan-out), each tagged `replayId` + `X-CNS-Replay: true`.
+4. The `Webhook λ` **re-renders from the pinned `templateVersion`** (R10) and the payload fetched by `payloadRef`, **re-signs with the *current* credentials** (bearer + HMAC), and POSTs — through the *same* SSRF guard, retry, breaker, and DLQ path as a first delivery.
+5. **Idempotent by construction:** the consumer keys on `notifId`, so replaying something it already processed is a safe no-op on their side; replaying something it missed delivers it.
+6. If the payload is **past its retention/TTL**, replay is unavailable for that item and is audited `replay_skipped:expired` — the panel shows it as un-replayable rather than failing silently.
+
+Replay is a deliberate admin action, so it **bypasses the resolved-check** by default (you asked for these to be re-sent); a `respectResolution:true` flag honors suppression if the tenant prefers. Every replay is audited (`replay_requested{selection, count, principal}`, `webhook_replayed`), so "who re-sent what, and when" is one query. The same visibility+replay surface generalizes to other channels, but ships webhook-first because that's where tenants integrate programmatically.
 
 ---
 
@@ -347,7 +405,7 @@ Unchanged from v1.3 §10.6 (T1 design-time author + T2 signature-gated runtime r
 | `InboxItem` | unchanged keys (`PK tenant#user`, `SK createdAt#notifId`, GSI on `groupKey`, `expiresAt` TTL) — **`contentVersion`/`enrichedAt` removed**: one version only |
 | `ResolutionGroup`, `DeliveryRecord` (outbox), `IdempotencyKey`, `AuditEvent` | unchanged (`DeliveryRecord.channel` enum + `httpStatus`/`attempt` now also cover webhook/push/sms) |
 | `Connection` (WebSocket registry) | **deleted — AppSync manages connections** |
-| **`WebhookEndpoint`** (new) | `PK tenant#endpointId` · `url`, `secretRef`, `subscribedTypes[]`, `status(pending\|active\|disabled)`, `breakerState`, `consecutiveFailures`, `customHeaders`, `mTLS`, `verifiedAt` — §3.6.1 |
+| **`WebhookEndpoint`** (new) | `PK tenant#endpointId` · `url`, **`secretRef` (HMAC) + `bearerTokenRef` — two independently rotatable credentials, each with a `current`/`previous` overlap** (`rotationOverlapHours`, `secretRotatedAt`, `bearerRotatedAt`), `subscribedTypes[]`, `status(pending\|active\|disabled)`, `breakerState`, `consecutiveFailures`, `customHeaders`, `mTLS`, `verifiedAt` — §3.6.1 |
 | **`DeviceToken`** (new) | `PK tenant#user`, `SK device#id` · `platform(ios\|android\|web)`, `token`, `appVersion`, `locale`, `active`, `lastSeenAt` — pruned on provider "unregistered" — §3.6.2 |
 | **`SmsConsent`** (new) | `PK tenant#user` (or `phone#hash`) · `status(opted_in\|opted_out)`, `source`, `updatedAt` — STOP/HELP driven suppression — §3.6.3 |
 | `NotificationType.channels` enum | gains **`webhook`, `push`, `sms`** with per-channel settings (`push.contentPolicy`, `push.collapseKey`, `push.ttl`, `sms.contentPolicy`, `sms.maxSegments`, `sms.senderIdPolicy`, webhook via tenant endpoint registry) |
@@ -393,11 +451,22 @@ Unchanged: CRUD types/templates/mappings/org-overrides/ai-budgets, template prom
 
 ```
 CRUD /v1/admin/webhooks                     register / update / disable tenant endpoints
+                                            (set url, subscribedTypes[], custom headers;
+                                             HMAC secret + bearer token auto-generated, shown once)
 POST /v1/admin/webhooks/{id}/verify         (re)send the signed verification challenge
-POST /v1/admin/webhooks/{id}/rotate-secret  dual-sign window for zero-downtime rotation
+POST /v1/admin/webhooks/{id}/rotate-secret  rotate the HMAC signing secret (dual-sign overlap window)
+POST /v1/admin/webhooks/{id}/rotate-token   rotate the Authorization: Bearer token (make-before-break)
+     { "overlapHours": 48 }                 optional per-rotation overlap; both default to 48h
+GET  /v1/admin/webhooks/{id}/credentials    masked current + previous of BOTH secrets, *RotatedAt,
+                                            overlap expiry — the admin-panel rotation view
+GET  /v1/admin/webhooks/{id}/stats          delivery rollups / calculations (§3.6.5)
+GET  /v1/admin/webhooks/{id}/deliveries     filterable delivery log (from/to/type/status)
+POST /v1/admin/webhooks/{id}/replay         replay a single message / time-frame / filtered set
 POST /v1/admin/webhooks/{id}/enable         clear the breaker after a fix
 CRUD /v1/admin/tenants/{id}/sms-budget      per-tenant SMS spend/rate cap (TenantAiBudget pattern)
 ```
+
+The admin panel exposes both credentials side by side: a **Rotate secret** and a **Rotate token** action, each showing `current`/`previous` (masked, copy-once reveal), the last-rotated timestamp, and when the overlap window closes — so an operator can rotate either credential on its own schedule without ever dropping a delivery.
 
 ---
 

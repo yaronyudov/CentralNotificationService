@@ -46,5 +46,8 @@ Mermaid sources (`.mmd`) are authoritative; PNGs are rendered from them.
 | `f9_sms.mmd` | Flow 9 — SMS (consent/STOP, segmentation, per-tenant budget, delivery receipts) |
 | `f10_login_to_inbox.mmd` | Flow 10 — full flow: login → JWT → subscribe → device register → notification → Bell |
 | `f11_resolve_race.mmd` | Flow 11 — fan-out resolved mid-flight: user X is **never** notified (unhappy path) |
+| `f12_webhook_admin.mmd` | Flow 12 — webhook admin panel: delivery visibility + replay (single / time-frame / filtered) |
+
+These detailed sequence diagrams are embedded directly in `Summary.html` at the relevant sections (Architecture, Channels, AI, Inbox, Webhook-ops, and a per-flow viewer). Open `Summary.html` from the repo root so the `diagrams/*.png` paths resolve.
 
 > The remaining PNGs (`flow_*.png`, `solA_components.png`, `solB_components.png`, `context.png`) are v1.3-era renders kept for the superseded Word document.

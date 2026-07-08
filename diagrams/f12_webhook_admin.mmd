@@ -1,0 +1,38 @@
+sequenceDiagram
+    autonumber
+    participant AD as Tenant Admin<br/>(admin panel)
+    participant API as Admin API<br/>(tenant-scoped JWT)
+    participant HOT as Hot audit index<br/>(DDB · last 7 days)
+    participant ATH as Athena<br/>(S3 Parquet · older)
+    participant PS as Payload store<br/>(pinned templateVersion)
+    participant WQ as webhook-q
+    participant WH as Webhook λ
+    participant EP as Tenant endpoint
+
+    Note over AD,ATH: ① VISIBILITY — a read view over audit data CNS already captures (no new store)
+    AD->>API: GET /v1/admin/webhooks/{id}/stats?from&to
+    API->>HOT: recent window (endpointId · last 7d)
+    API->>ATH: older window (partitions dt/type/tenant)
+    API-->>AD: sent · delivered · failed · suppressed · success% ·<br/>p50/p99 latency · status-code breakdown · breaker state
+    AD->>API: GET /v1/admin/webhooks/{id}/deliveries?from&to&type&status&cursor
+    API->>HOT: query + filter
+    API-->>AD: per-attempt rows: notifId · type · ts · httpStatus ·<br/>latency · attempt · outcome · reason (paged)
+    AD->>API: GET /v1/admin/webhooks/{id}/deliveries/{notifId}
+    API-->>AD: single delivery detail (all attempts + response)
+
+    Note over AD,EP: ② REPLAY — one message · a whole time-frame · a filtered time-frame
+    Note over AD: selection modes —<br/>{notifId} | {from,to} | {from,to, types:[X,Y], excludeTypes:[Z], status:failed}
+    AD->>API: POST /v1/admin/webhooks/{id}/replay {…selection…, dryRun:true}
+    API->>HOT: resolve selection → notifIds + count
+    API-->>AD: DRY-RUN: count + sample (nothing sent yet)
+    AD->>API: POST /v1/admin/webhooks/{id}/replay {…selection…, dryRun:false}
+    API->>WQ: enqueue replay tasks (paced waves · replayId · idempotent notifId)
+    WQ->>WH: receive
+    WH->>PS: fetch payloadRef → re-render with PINNED templateVersion (R10)
+    alt payload within retention
+        WH->>EP: POST re-signed with CURRENT creds ·<br/>Authorization: Bearer · X-CNS-Signature · X-CNS-Replay: true
+        EP-->>WH: 2xx ⇒ audit webhook_replayed{delivered}
+        Note over WH,EP: non-2xx ⇒ same retry → webhook-DLQ path ·<br/>consumer is idempotent on notifId, so a duplicate is safe
+    else payload past retention / TTL
+        Note over WH: replay unavailable — audit replay_skipped:expired
+    end

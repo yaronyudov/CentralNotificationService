@@ -70,6 +70,24 @@ const Callout = ({ title, children }) => (
   </div>
 );
 
+/* ————— detailed rendered diagram (PNG from diagrams/, relative to the repo) ————— */
+const Fig = ({ src, cap }) => (
+  <figure className="my-1 overflow-x-auto rounded-lg" style={{ border: `1px solid ${C.line}`, background: C.card }}>
+    <img src={`diagrams/${src}.png`} alt={cap || src}
+      style={{ minWidth: 640, width: "100%", display: "block" }} />
+    <figcaption className="px-3 py-1.5 text-xs" style={{ background: C.wash, color: C.sub }}>
+      Full sequence diagram — <span style={mono}>diagrams/{src}.mmd</span>{cap ? ` · ${cap}` : ""}
+    </figcaption>
+  </figure>
+);
+
+/* ————— flow key → detailed diagram file ————— */
+const FLOW_DIAGRAM = {
+  f1: "f1_explicit", f2: "f2_fanout", f3: "f3_enrichment", f4: "f4_inbox", f5: "f5_triage",
+  f7: "f7_webhook", f8: "f8_push", f9: "f9_sms", f10: "f10_login_to_inbox",
+  f11: "f11_resolve_race", f12: "f12_webhook_admin",
+};
+
 /* ————— SVG diagram primitives ————— */
 const Box = ({ x, y, w, h, l1, l2, tone }) => {
   const fills = { accent: [C.accentSoft, C.accent, C.warn], light: ["#EFF3F7", C.line, C.sub],
@@ -307,17 +325,18 @@ const FLOWS = {
     actors: ["Admin", "Endpoint reg", "Webhook λ", "SSRF guard", "Tenant HTTPS", "webhook-DLQ"],
     steps: [
       { note: "① register: POST /v1/admin/webhooks → signed verification challenge, must echo nonce ⇒ status active" },
-      { f: 0, t: 1, label: "register {url, subscribedTypes[]} · secret in Secrets Mgr" },
+      { f: 0, t: 1, label: "register {url, subscribedTypes[]} · HMAC secret + Bearer token (both in Secrets Mgr)" },
       { f: 2, t: 4, label: "endpoint.verification (signed) → echo nonce ⇒ active", dashed: true },
       { note: "② deliver — resolvable types re-check ResolutionGroup first (suppress if resolved)" },
       { f: 2, t: 1, label: "list active endpoints where subscribedTypes ∋ typeId" },
       { f: 2, t: 3, label: "resolve host → validate PUBLIC ip → pin ip (no redirects)" },
       { note: "private / link-local / 169.254 metadata IP ⇒ BLOCKED, audited webhook_blocked:ssrf — never reaches the VPC" },
-      { f: 2, t: 4, label: "POST body + X-CNS-Signature: HMAC-SHA256(secret, ts.body) + notifId", tone: "accent" },
+      { f: 2, t: 4, label: "POST + Authorization: Bearer (edge auth) + X-CNS-Signature v1=HMAC(current),v1=HMAC(previous) + notifId", tone: "accent" },
       { f: 4, t: 2, label: "2xx ⇒ delivered (DeliveryRecord sending→delivered)", dashed: true },
       { note: "non-2xx / timeout ⇒ full-jitter retry (honor Retry-After); breaker opens → endpoint auto-disabled + tenant alerted" },
       { f: 2, t: 5, label: "maxReceiveCount → webhook-DLQ (ALARM)" },
-      { note: "consumer contract: verify signature · reject if |now−ts|>5m · 2xx fast · idempotent on notifId · at-least-once" },
+      { note: "consumer contract: check Bearer at the edge + verify signature over raw body · reject if |now−ts|>5m · idempotent on notifId" },
+      { note: "③ rotate (admin): rotate-secret ⇒ dual v1= signatures during overlap · rotate-token ⇒ make-before-break — both zero-gap, audited" },
     ],
   },
   f8: {
@@ -394,6 +413,26 @@ const FLOWS = {
       { note: "audit: suppressed:already-resolved {user:X} — X never sees a wallet-underfunded notification" },
     ],
   },
+  f12: {
+    label: "12 · Webhook admin — visibility + replay",
+    actors: ["Admin", "Admin API", "Audit index", "webhook-q", "Webhook λ", "Endpoint"],
+    steps: [
+      { note: "① VISIBILITY — a read view over audit data CNS already captures (no new store)" },
+      { f: 0, t: 1, label: "GET /webhooks/{id}/stats?from&to" },
+      { f: 1, t: 2, label: "hot index (7d) + Athena (older, partitioned dt/type/tenant)" },
+      { f: 1, t: 0, label: "sent · delivered · failed · success% · p50/p99 · status-code breakdown", dashed: true },
+      { f: 0, t: 1, label: "GET /webhooks/{id}/deliveries?from&to&type&status" },
+      { f: 1, t: 0, label: "per-attempt log: notifId · type · httpStatus · latency · outcome · reason", dashed: true },
+      { note: "② REPLAY — {notifId} | {from,to} | {from,to, types:[X,Y], excludeTypes:[Z], status:failed}" },
+      { f: 0, t: 1, label: "POST /replay {…selection…, dryRun:true}" },
+      { f: 1, t: 0, label: "DRY-RUN: count + sample (nothing sent yet)", dashed: true },
+      { f: 0, t: 1, label: "POST /replay {…selection…, dryRun:false} — confirm" },
+      { f: 1, t: 3, label: "enqueue replay tasks — paced · replayId · idempotent notifId" },
+      { f: 3, t: 4, label: "receive" },
+      { f: 4, t: 5, label: "re-render (PINNED templateVersion) + re-sign (current creds) + POST X-CNS-Replay", tone: "accent" },
+      { note: "idempotent on notifId ⇒ safe to double-replay · payload past retention ⇒ audited replay_skipped:expired" },
+    ],
+  },
 };
 
 /* ————— content data ————— */
@@ -424,7 +463,7 @@ const entities = [
   ["DeliveryRecord", "outbox per notifId·channel: sending→sent|failed|suppressed + providerMsgId"],
   ["IdempotencyKey", "tenant#eventId, TTL 48 h — duplicate producer calls are free"],
   ["AuditEvent", "auditId = notifId#stage#attempt (idempotent) · stage · outcome · reason — no payload, recipient as HMAC token; new: enrich_* · webhook_* · push_* · sms_* · suppressed:already-resolved"],
-  ["WebhookEndpoint (new)", "tenant#endpointId · url · secretRef (HMAC key) · subscribedTypes[] · status(pending|active|disabled) · breakerState · consecutiveFailures · mTLS — §3.6.1"],
+  ["WebhookEndpoint (new)", "tenant#endpointId · url · secretRef (HMAC) + bearerTokenRef — two independently rotatable creds, each current+previous overlap (rotationOverlapHours, *RotatedAt) · subscribedTypes[] · status(pending|active|disabled) · breakerState · mTLS — §3.6.1"],
   ["DeviceToken (new)", "tenant#user · device#id · platform(ios|android|web) · token · appVersion · locale · active — pruned on provider 'unregistered' — §3.6.2"],
   ["SmsConsent (new)", "tenant#user (or phone#hash) · status(opted_in|opted_out) · source · updatedAt — STOP/HELP driven suppression — §3.6.3"],
   ["Recipient kinds", "user · role · externalEmail · slackChannel + externalPhone (SMS to a non-user number)"],
@@ -442,7 +481,7 @@ const channelCatalog = [
 
 const webhookAtoZ = [
   { t: "A · Register + verify", d: "Admin registers {url, subscribedTypes[]}; CNS POSTs a signed verification challenge the endpoint must echo before status flips pending→active. Proves ownership, catches typo'd URLs before any real event." },
-  { t: "B · Sign every request", d: "X-CNS-Signature: t=<ts>,v1=HMAC-SHA256(secret, ts.body). The consumer recomputes over raw bytes (constant-time) to authenticate CNS + verify integrity; the signed timestamp lets it reject replays (>5 min). Dual-sign window = zero-downtime secret rotation." },
+  { t: "B · Two-layer auth — bearer + HMAC, both rotatable", d: "Layer 1 — Authorization: Bearer <token>: an opaque per-endpoint secret in a standard header, so the consumer's edge (API GW / WAF) can reject non-CNS traffic BEFORE app code. Layer 2 — X-CNS-Signature: t=<ts>,v1=HMAC-SHA256(secret, ts.body): recomputed over raw bytes (constant-time) for body integrity + replay rejection (>5 min). CNS always sends both; belt-and-suspenders. Both credentials are INDEPENDENTLY ROTATABLE with a current+previous overlap (default 48h): HMAC rotation is coordination-free (two v1= signatures during the window); bearer rotation is make-before-break (tenant adds the new token, then the old is revoked). The admin panel shows both, masked, with last-rotated + overlap expiry." },
   { t: "C · SSRF / egress hardening (load-bearing)", d: "URL is tenant-controlled, so: HTTPS only · resolve DNS + validate every IP is PUBLIC (block RFC-1918, loopback, 169.254 metadata) · PIN the validated IP for the connection (defeats DNS-rebinding TOCTOU) · no redirects · dedicated egress subnet that can't reach the VPC. A payroll service must never be tricked into hitting an internal host." },
   { t: "D · Reliability & backpressure", d: "Outbox DeliveryRecord before send; 2xx=success; non-2xx/timeout ⇒ full-jitter retry (honor Retry-After) → webhook-DLQ (alarm@1). Per-endpoint circuit breaker auto-disables a chronically-failing endpoint (+ tenant alert) — one bad endpoint never becomes an infinite bill. Per-endpoint bulkhead so one slow tenant can't starve the Lambda pool." },
   { t: "E · Consumer contract", d: "Return 2xx fast (slow work async) · verify the signature · treat as at-least-once + idempotent on X-CNS-Notif-Id · tolerate out-of-order (use occurredAt)." },
@@ -584,6 +623,7 @@ const SECTIONS = [
   { id: "numbers", label: "Numbers" },
   { id: "arch", label: "Architecture" },
   { id: "channels", label: "Channels" },
+  { id: "webhookops", label: "Webhook ops" },
   { id: "flows", label: "Flows" },
   { id: "inbox", label: "Inbox rules" },
   { id: "api", label: "APIs" },
@@ -692,6 +732,7 @@ function App() {
             ["Progressive enrichment (v1→v2, email hold, upgrade window)", "AI gate: stage=enrich → message WAITS → republish stage=deliver; ONE content version everywhere"],
             ["Two alternatives + iteration logs + scoring", "one solution; Kafka/EKS kept as a 1-page scale-up appendix with revisit triggers"],
             ["3 channels (in-app · email · Slack)", "6 channels — added webhook, mobile push, SMS with ZERO pipeline change (Channels tab); + delivery-time resolved-check"],
+            ["No tenant delivery visibility", "Webhook admin panel (Webhook-ops tab): delivery stats/log + replay by single message / time-frame / filtered type — over existing audit data"],
           ]} />
           <div className="text-sm">
             <span className="font-bold" style={{ color: C.navy }}>Unchanged and still load-bearing: </span>
@@ -719,6 +760,7 @@ function App() {
 
         <Section id="arch" title="Architecture" kicker="1 intake λ · 1 SNS topic · 1 λ per channel">
           <Arch />
+          <Fig src="v14_components" cap="the full component flow — six channels, the AI gate, and the AppSync in-app surface" />
           <div className="grid gap-2 sm:grid-cols-2">
             <div className="rounded-lg p-3" style={{ background: C.wash }}>
               <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Tenant isolation (ADR-2)</div>
@@ -755,6 +797,7 @@ function App() {
               </div>
             ))}
           </div>
+          <Fig src="f7_webhook" cap="register + verify · SSRF guard · bearer + dual-HMAC signing · breaker/DLQ · rotate both creds" />
           <div className="grid gap-2 sm:grid-cols-2">
             <div className="rounded-lg p-3" style={{ background: C.wash }}>
               <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Mobile / web push</div>
@@ -771,11 +814,52 @@ function App() {
                 phone numbers HMAC-tokenized in audit.</div>
             </div>
           </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <Fig src="f8_push" cap="device registry, multi-device fan-out, token pruning" />
+            <Fig src="f9_sms" cap="consent + STOP, segmentation, per-tenant budget, delivery receipts" />
+          </div>
         </Section>
 
-        <Section id="flows" title="Sequence flows" kicker="11 flows including login→inbox (f10) & the resolve race (f11) · sources in diagrams/*.mmd">
+        <Section id="webhookops" title="Webhook visibility & replay" kicker="tenant admin panel — what was sent/failed + re-send by message / time-frame / filter">
+          <div className="text-sm">
+            The tenant answers two operational questions itself: <b>“what did CNS send me, and what failed?”</b> and <b>“re-send the ones I missed.”</b>
+            Both are served from data CNS <b>already captures</b> (per-attempt audit events + the outbox) — a scoped read + a re-enqueue, <b>not</b> new storage.
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="rounded-lg p-3" style={{ background: C.wash }}>
+              <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Visibility — the calculations</div>
+              <div className="mt-1 text-sm">Per-endpoint over any <span style={mono}>from</span>/<span style={mono}>to</span>: <b>sent · delivered · failed · suppressed</b>,
+                <b> success rate</b>, <b>p50/p99 latency</b>, HTTP <b>status-code breakdown</b>, volume by type, breaker state. Plus a filterable
+                <b> delivery log</b> (one row per attempt: notifId · type · status · latency · outcome · reason). Last 7 days from the hot index; older from Athena.</div>
+            </div>
+            <div className="rounded-lg p-3" style={{ background: C.accentSoft, borderLeft: `4px solid ${C.accent}` }}>
+              <div className="text-xs font-bold uppercase" style={{ color: "#8A3A12" }}>Replay — three selection modes</div>
+              <div className="mt-1 text-sm"><b>①</b> a single message <span style={mono}>{"{notifId}"}</span> · <b>②</b> a whole time-frame
+                <span style={mono}> {"{from,to}"}</span> · <b>③</b> a filtered time-frame <span style={mono}>{"{from,to, types:[X,Y], excludeTypes:[Z], status:failed}"}</span>
+                — e.g. only types X, Y (not Z) that failed.</div>
+            </div>
+          </div>
+          <div className="text-sm">
+            <b>Kept simple by reuse:</b> <b>dry-run first</b> (returns count + sample, sends nothing) → confirm → replay tasks enqueue onto
+            <span style={mono}> webhook-q</span> in <b>paced waves</b> → the <span style={mono}>Webhook λ</span> <b>re-renders from the pinned templateVersion</b> and
+            <b> re-signs with current credentials</b>, through the same SSRF/retry/breaker/DLQ path. <b>Idempotent on <span style={mono}>notifId</span></b>, so double-replay is safe;
+            a payload past retention is un-replayable and audited <span style={mono}>replay_skipped:expired</span>. Every replay is audited (<span style={mono}>who · what · count</span>).
+          </div>
+          <Code>{`GET  /v1/admin/webhooks/{id}/stats?from&to                  // rollups / calculations
+GET  /v1/admin/webhooks/{id}/deliveries?from&to&type&status // delivery log (filterable)
+GET  /v1/admin/webhooks/{id}/deliveries/{notifId}           // single-delivery detail
+POST /v1/admin/webhooks/{id}/replay
+  { "notifId":"3f9c…" }                                     // ① single message
+  { "from":"…","to":"…" }                                   // ② whole time-frame
+  { "from":"…","to":"…", "types":["X","Y"],                 // ③ filtered time-frame
+    "excludeTypes":["Z"], "status":"failed", "dryRun":true }`}</Code>
+          <Fig src="f12_webhook_admin" cap="visibility (stats + delivery log) → replay: single / time-frame / filtered, with dry-run + paced re-send" />
+        </Section>
+
+        <Section id="flows" title="Sequence flows" kicker="pick a flow — the interactive view + the full rendered sequence diagram show below (counter f6 is under Inbox)">
           <Pick value={flow} set={setFlow} opts={Object.entries(FLOWS).map(([k, v]) => [k, v.label])} />
           <Seq actors={FLOWS[flow].actors} steps={FLOWS[flow].steps} />
+          {FLOW_DIAGRAM[flow] && <Fig src={FLOW_DIAGRAM[flow]} cap={FLOWS[flow].label} />}
           {flow === "f11" && (
             <Callout title="Why user X is never notified — the point of flow 11">
               A large fan-out is split into paced waves. The fix event (<span style={mono}>wallet.funds_added</span>) resolves the group
@@ -796,6 +880,8 @@ function App() {
             ["Live badge — calculation", <span key="b1"><b>Transition-driven, not counted:</b> +1 rides the item create in <b>one transaction</b> (a retry fails the whole txn ⇒ no double-count); −1 only when a conditional <span style={mono}>unread→read|dismissed|resolved</span> transition <i>wins</i> — racing decrements can't both pass the condition. Expiry: the TTL stream REMOVE with <span style={mono}>oldImage.state=unread</span> decrements (idempotency-marked — the one non-transactional leg).</span>],
             ["Live badge — reconciliation ladder", <span key="b2"><b>L1 at read time:</b> opening the inbox recounts that user's single partition for pennies and silently overwrites — active users self-heal at the only moment a wrong badge is visible. <b>L2 weekly sweep:</b> dormant accounts only. <b>L3 the point:</b> the sweep's drift-rate metric is a <b>bug tripwire</b> — a spike pages long before users complain.</span>],
           ]} />
+          <Fig src="f4_inbox" cap="inbox read / mark-read / backup-resolve via AppSync (direct DDB resolvers, no Lambda)" />
+          <Fig src="f6_counter" cap="unread-counter lifecycle + the L1/L2 reconciliation ladder" />
         </Section>
 
         <Section id="api" title="Public surfaces" kicker="producer · bus mapping · AppSync inbox · admin">
@@ -860,6 +946,18 @@ POST /v1/admin/dlq/{queue}/redrive      // one-click, idempotent-safe — also t
 
 { "tenantId":"org_912", "monthlyTokenCap": 25000000,
   "perType": {"wallet.underfunded": 2000000}, "onExhaust": "park+alert" }`}</Code>
+          <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Admin — webhook endpoints (two rotatable credentials)</div>
+          <Code>{`CRUD /v1/admin/webhooks                     // url, subscribedTypes[], headers
+                                            // HMAC secret + Bearer token auto-generated, shown once
+POST /v1/admin/webhooks/{id}/verify         // (re)send the signed verification challenge
+POST /v1/admin/webhooks/{id}/rotate-secret  // HMAC — dual-sign overlap window (coordination-free)
+POST /v1/admin/webhooks/{id}/rotate-token   // Bearer — make-before-break  { "overlapHours": 48 }
+GET  /v1/admin/webhooks/{id}/credentials    // masked current+previous of BOTH · *RotatedAt · expiry
+POST /v1/admin/webhooks/{id}/enable         // clear the breaker after a fix
+
+// device + consent (push / SMS) + SMS spend cap
+registerDevice / unregisterDevice / setSmsConsent   // AppSync mutations (tenant#user from JWT)
+CRUD /v1/admin/tenants/{id}/sms-budget              // per-tenant SMS spend/rate cap`}</Code>
         </Section>
 
         <Section id="data" title="Data model — the load-bearing keys">
@@ -889,6 +987,7 @@ POST /v1/admin/dlq/{queue}/redrive      // one-click, idempotent-safe — also t
             fields and the channel λs render <b>one version</b> — identical in the inbox and the email. The v1.3 progressive machinery
             (contentVersion v1/v2, email hold window, upgrade window) is deleted.
           </Callout>
+          <Fig src="f3_enrichment" cap="the AI gate — wait, gates, classified backoff retries, DLQ + mandatory alarm, republish stage=deliver" />
           <div className="text-xs font-bold uppercase" style={{ color: C.navy }}>Gate order (per message)</div>
           <div className="text-sm">
             signature cache → <b>TenantAiBudget check (before invoke)</b> → context fetch (payloadRef + allow-listed views, ≤ 150 ms, breaker) →
